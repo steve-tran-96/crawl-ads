@@ -26,6 +26,9 @@ PAGE_WAIT         = 8
 BROWSER_ARGS = [
     "--no-sandbox",
     "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+    "--disable-blink-features=AutomationControlled",
     "--lang=vi-VN",
 ]
 
@@ -172,8 +175,21 @@ async def run_scrape(
         try:
             await page0.wait_for_selector("creative-preview", timeout=30_000)
         except PlaywrightTimeout:
+            screenshot_path = output_file.parent / f"{output_file.stem}_debug.png"
+            try:
+                await page0.screenshot(path=str(screenshot_path), full_page=True)
+                log.warning(f"Screenshot đã lưu tại: {screenshot_path}")
+            except Exception:
+                pass
+            page_title = await page0.title()
+            page_url = page0.url
+            log.error(f"Timeout! Title: '{page_title}' | URL: {page_url}")
             await browser.close()
-            raise RuntimeError("Không tìm thấy quảng cáo nào. Kiểm tra lại URL.")
+            raise RuntimeError(
+                f"Không tìm thấy quảng cáo nào. "
+                f"Title trang: '{page_title}'. "
+                f"Có thể bị chặn hoặc URL sai."
+            )
 
         await status("Đang scroll thu thập danh sách quảng cáo...")
         hrefs = await scroll_and_collect_links(page0)
