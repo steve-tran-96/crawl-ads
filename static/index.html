@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Google Ads Scraper</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #f0f2f5;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      padding: 24px;
+    }
+
+    .card {
+      background: #fff;
+      border-radius: 16px;
+      box-shadow: 0 4px 24px rgba(0,0,0,.08);
+      padding: 40px 44px;
+      width: 100%;
+      max-width: 640px;
+    }
+
+    .logo {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 28px;
+    }
+    .logo svg { flex-shrink: 0; }
+    .logo h1 { font-size: 20px; font-weight: 700; color: #1a1a2e; }
+    .logo span { font-size: 20px; font-weight: 400; color: #5f6368; }
+
+    label {
+      display: block;
+      font-size: 13px;
+      font-weight: 600;
+      color: #444;
+      margin-bottom: 8px;
+      letter-spacing: .02em;
+    }
+
+    .input-row {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 24px;
+    }
+
+    input[type="text"] {
+      flex: 1;
+      height: 46px;
+      border: 1.5px solid #d1d5db;
+      border-radius: 10px;
+      padding: 0 14px;
+      font-size: 14px;
+      color: #1a1a2e;
+      outline: none;
+      transition: border-color .2s;
+    }
+    input[type="text"]:focus { border-color: #4f46e5; }
+    input[type="text"]::placeholder { color: #9ca3af; }
+
+    button {
+      height: 46px;
+      padding: 0 22px;
+      border: none;
+      border-radius: 10px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity .15s, transform .1s;
+      white-space: nowrap;
+    }
+    button:active { transform: scale(.97); }
+    button:disabled { opacity: .5; cursor: not-allowed; transform: none; }
+
+    #scrapeBtn {
+      background: #4f46e5;
+      color: #fff;
+    }
+    #scrapeBtn:hover:not(:disabled) { background: #4338ca; }
+
+    /* Progress section */
+    #progressSection {
+      display: none;
+      margin-bottom: 0;
+    }
+
+    .progress-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 10px;
+    }
+    .progress-label { font-size: 13px; color: #6b7280; }
+    .progress-count { font-size: 13px; font-weight: 600; color: #4f46e5; }
+
+    .progress-track {
+      height: 8px;
+      background: #e5e7eb;
+      border-radius: 99px;
+      overflow: hidden;
+      margin-bottom: 12px;
+    }
+    .progress-fill {
+      height: 100%;
+      background: linear-gradient(90deg, #4f46e5, #818cf8);
+      border-radius: 99px;
+      width: 0%;
+      transition: width .4s ease;
+    }
+
+    .status-text {
+      font-size: 13px;
+      color: #6b7280;
+      min-height: 20px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .spinner {
+      width: 14px; height: 14px;
+      border: 2px solid #e5e7eb;
+      border-top-color: #4f46e5;
+      border-radius: 50%;
+      animation: spin .7s linear infinite;
+      flex-shrink: 0;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* Done state */
+    #doneSection {
+      display: none;
+      margin-top: 20px;
+      padding: 18px 20px;
+      background: #f0fdf4;
+      border: 1.5px solid #86efac;
+      border-radius: 12px;
+    }
+    .done-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .done-info { display: flex; align-items: center; gap: 10px; }
+    .done-icon { font-size: 22px; }
+    .done-text h3 { font-size: 15px; font-weight: 700; color: #166534; }
+    .done-text p { font-size: 13px; color: #4ade80; margin-top: 2px; }
+
+    #downloadBtn {
+      background: #16a34a;
+      color: #fff;
+      padding: 0 18px;
+      font-size: 13px;
+    }
+    #downloadBtn:hover { background: #15803d; }
+
+    /* Error state */
+    #errorSection {
+      display: none;
+      margin-top: 20px;
+      padding: 14px 18px;
+      background: #fef2f2;
+      border: 1.5px solid #fca5a5;
+      border-radius: 12px;
+      font-size: 13px;
+      color: #b91c1c;
+    }
+
+    .hint {
+      margin-top: 16px;
+      font-size: 12px;
+      color: #9ca3af;
+      line-height: 1.6;
+    }
+    .hint code {
+      background: #f3f4f6;
+      border-radius: 4px;
+      padding: 1px 5px;
+      font-family: monospace;
+      font-size: 11px;
+      color: #6b7280;
+    }
+  </style>
+</head>
+<body>
+
+<div class="card">
+
+  <!-- Logo -->
+  <div class="logo">
+    <svg width="32" height="32" viewBox="0 0 32 32" fill="none">
+      <rect width="32" height="32" rx="8" fill="#4f46e5"/>
+      <path d="M9 22l5-8 4 5 3-4 5 7H9z" fill="white" opacity=".9"/>
+      <circle cx="22" cy="11" r="3" fill="#818cf8"/>
+    </svg>
+    <h1>Ads Scraper <span>/ Google Transparency</span></h1>
+  </div>
+
+  <!-- Input -->
+  <label for="urlInput">URL nhà quảng cáo</label>
+  <div class="input-row">
+    <input
+      type="text"
+      id="urlInput"
+      placeholder="https://adstransparency.google.com/advertiser/AR..."
+    />
+    <button id="scrapeBtn" onclick="startScrape()">Scrape</button>
+  </div>
+
+  <!-- Progress -->
+  <div id="progressSection">
+    <div class="progress-header">
+      <span class="progress-label">Đang cào dữ liệu…</span>
+      <span class="progress-count" id="countText">0 / 0</span>
+    </div>
+    <div class="progress-track">
+      <div class="progress-fill" id="progressFill"></div>
+    </div>
+    <div class="status-text">
+      <div class="spinner" id="spinner"></div>
+      <span id="statusMsg">Đang khởi động trình duyệt…</span>
+    </div>
+  </div>
+
+  <!-- Done -->
+  <div id="doneSection">
+    <div class="done-row">
+      <div class="done-info">
+        <span class="done-icon">✅</span>
+        <div class="done-text">
+          <h3>Hoàn tất!</h3>
+          <p id="doneMsg"></p>
+        </div>
+      </div>
+      <button id="downloadBtn" onclick="downloadFile()">⬇ Tải Excel</button>
+    </div>
+  </div>
+
+  <!-- Error -->
+  <div id="errorSection">
+    ⚠️ <span id="errorMsg"></span>
+  </div>
+
+  <p class="hint">
+    Dán URL từ <code>adstransparency.google.com/advertiser/AR...</code><br/>
+    Ví dụ: <code>https://adstransparency.google.com/advertiser/AR00718079396149198849?region=VN&preset-date=Today</code>
+  </p>
+
+</div>
+
+<script>
+  let jobId = null;
+  let pollTimer = null;
+
+  async function startScrape() {
+    const url = document.getElementById('urlInput').value.trim();
+    if (!url) {
+      alert('Vui lòng nhập URL.');
+      return;
+    }
+
+    // Reset UI
+    setSection('progress');
+    document.getElementById('scrapeBtn').disabled = true;
+    document.getElementById('progressFill').style.width = '0%';
+    document.getElementById('countText').textContent = '0 / 0';
+    document.getElementById('statusMsg').textContent = 'Đang khởi động…';
+
+    try {
+      const res = await fetch('/api/scrape', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url }),
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        showError(err.detail || 'Lỗi khi gửi yêu cầu.');
+        return;
+      }
+      const data = await res.json();
+      jobId = data.job_id;
+      pollTimer = setInterval(pollStatus, 2000);
+    } catch (e) {
+      showError('Không kết nối được tới server.');
+    }
+  }
+
+  async function pollStatus() {
+    if (!jobId) return;
+    try {
+      const res = await fetch(`/api/status/${jobId}`);
+      const job = await res.json();
+
+      const pct = job.total > 0 ? (job.progress / job.total) * 100 : 0;
+      document.getElementById('progressFill').style.width = pct + '%';
+      document.getElementById('countText').textContent = `${job.progress} / ${job.total}`;
+      document.getElementById('statusMsg').textContent = job.message || '…';
+
+      if (job.status === 'done') {
+        clearInterval(pollTimer);
+        setSection('done');
+        document.getElementById('doneMsg').textContent =
+          `Đã cào ${job.total} quảng cáo thành công.`;
+        document.getElementById('scrapeBtn').disabled = false;
+      } else if (job.status === 'error') {
+        clearInterval(pollTimer);
+        showError(job.error || 'Lỗi không xác định.');
+      }
+    } catch (e) {
+      // network hiccup, keep polling
+    }
+  }
+
+  function downloadFile() {
+    if (jobId) window.location = `/api/download/${jobId}`;
+  }
+
+  function setSection(name) {
+    document.getElementById('progressSection').style.display = name === 'progress' ? 'block' : 'none';
+    document.getElementById('doneSection').style.display     = name === 'done'     ? 'block' : 'none';
+    document.getElementById('errorSection').style.display   = name === 'error'    ? 'block' : 'none';
+  }
+
+  function showError(msg) {
+    setSection('error');
+    document.getElementById('errorMsg').textContent = msg;
+    document.getElementById('scrapeBtn').disabled = false;
+  }
+</script>
+
+</body>
+</html>

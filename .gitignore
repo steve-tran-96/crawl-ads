@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.Python
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.env
+
+# Environment variables / secrets
+.env
+.env.*
+*.env
+
+# Outputs & exports (generated files)
+outputs/
+*.xlsx
+*.csv
+*.json
+
+# Playwright
+playwright-report/
+test-results/
+.playwright/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Logs
+*.log
+logs/
+
+# pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
