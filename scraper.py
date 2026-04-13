@@ -50,9 +50,8 @@ def yt_link(video_id: str | None) -> str:
 
 async def scroll_and_collect_links(page) -> list[str]:
     seen: set[str] = set()
-    no_change = 0
     scroll_y = 0
-    while no_change < MAX_EMPTY_SCROLLS:
+    while True:
         cards = await page.query_selector_all("creative-preview a[href]")
         hrefs = set()
         for c in cards:
@@ -62,14 +61,27 @@ async def scroll_and_collect_links(page) -> list[str]:
         new = hrefs - seen
         if new:
             seen.update(new)
-            no_change = 0
             log.info(f"Scroll: tìm thấy {len(seen)} quảng cáo (+{len(new)} mới)")
-        else:
-            no_change += 1
-            log.info(f"Scroll: không có item mới ({no_change}/{MAX_EMPTY_SCROLLS})")
+
         scroll_y += SCROLL_STEP
         await page.evaluate(f"window.scrollTo(0, {scroll_y})")
         await asyncio.sleep(SCROLL_PAUSE)
+
+        # Kiểm tra đã chạm đáy trang thật sự chưa
+        at_bottom = await page.evaluate(
+            "window.scrollY + window.innerHeight >= document.body.scrollHeight - 50"
+        )
+        if at_bottom:
+            # Chờ thêm 1 lần để trang có thể lazy-load thêm
+            await asyncio.sleep(SCROLL_PAUSE)
+            cards = await page.query_selector_all("creative-preview a[href]")
+            for c in cards:
+                href = await c.get_attribute("href")
+                if href and "/creative/" in href:
+                    seen.add(href)
+            log.info(f"Đã chạm đáy trang. Tổng: {len(seen)} quảng cáo.")
+            break
+
     return sorted(seen)
 
 
