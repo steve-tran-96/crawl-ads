@@ -260,6 +260,17 @@
   let jobId = null;
   let pollTimer = null;
 
+  // Khi load trang, kiểm tra xem có job cũ đang chạy không
+  window.addEventListener('DOMContentLoaded', () => {
+    const savedJobId = localStorage.getItem('jobId');
+    if (savedJobId) {
+      jobId = savedJobId;
+      setSection('progress');
+      document.getElementById('scrapeBtn').disabled = true;
+      pollTimer = setInterval(pollStatus, 2000);
+    }
+  });
+
   async function startScrape() {
     const url = document.getElementById('urlInput').value.trim();
     if (!url) {
@@ -287,6 +298,7 @@
       }
       const data = await res.json();
       jobId = data.job_id;
+      localStorage.setItem('jobId', jobId);
       pollTimer = setInterval(pollStatus, 2000);
     } catch (e) {
       showError('Không kết nối được tới server.');
@@ -299,6 +311,7 @@
       const res = await fetch(`/api/status/${jobId}`);
       if (res.status === 404) {
         clearInterval(pollTimer);
+        localStorage.removeItem('jobId');
         showError('Job không còn tồn tại (server có thể đã restart). Vui lòng thử lại.');
         return;
       }
@@ -311,12 +324,14 @@
 
       if (job.status === 'done') {
         clearInterval(pollTimer);
+        localStorage.removeItem('jobId');
         setSection('done');
         document.getElementById('doneMsg').textContent =
           `Đã cào ${job.total} quảng cáo thành công.`;
         document.getElementById('scrapeBtn').disabled = false;
       } else if (job.status === 'error') {
         clearInterval(pollTimer);
+        localStorage.removeItem('jobId');
         showError(job.error || 'Lỗi không xác định.');
       }
     } catch (e) {
