@@ -175,20 +175,16 @@ async def run_scrape(
         try:
             await page0.wait_for_selector("creative-preview", timeout=30_000)
         except PlaywrightTimeout:
-            screenshot_path = output_file.parent / f"{output_file.stem}_debug.png"
-            try:
-                await page0.screenshot(path=str(screenshot_path), full_page=True)
-                log.warning(f"Screenshot đã lưu tại: {screenshot_path}")
-            except Exception:
-                pass
             page_title = await page0.title()
             page_url = page0.url
+            body_text = (await page0.inner_text("body"))[:500]
             log.error(f"Timeout! Title: '{page_title}' | URL: {page_url}")
+            log.error(f"Nội dung trang (500 ký tự đầu): {body_text}")
             await browser.close()
             raise RuntimeError(
                 f"Không tìm thấy quảng cáo nào. "
-                f"Title trang: '{page_title}'. "
-                f"Có thể bị chặn hoặc URL sai."
+                f"Title: '{page_title}' | "
+                f"Nội dung: {body_text[:200]}"
             )
 
         await status("Đang scroll thu thập danh sách quảng cáo...")
