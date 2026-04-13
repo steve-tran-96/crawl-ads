@@ -84,10 +84,13 @@ async def _run_job(job_id: str, url: str):
     async def on_progress(current: int, total: int, cid: str):
         job["progress"] = current
         job["total"] = total
-        job["message"] = f"Đang xử lý {cid}…"
+        job["message"] = f"[{current}/{total}] Đang xử lý {cid}…"
+
+    async def on_status(message: str):
+        job["message"] = message
 
     try:
-        await run_scrape(url, output_file, on_progress)
+        await run_scrape(url, output_file, on_progress, on_status)
         job["status"] = "done"
         job["file"] = str(output_file)
         job["message"] = f"Hoàn tất {job['total']} quảng cáo."

@@ -3,6 +3,7 @@ scraper.py — Core scraping logic (dùng standalone hoặc import từ main.py)
 """
 
 import asyncio
+import logging
 import re
 import sys
 from pathlib import Path
@@ -10,6 +11,13 @@ from typing import Callable, Awaitable
 
 import pandas as pd
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("scraper")
 
 SCROLL_PAUSE      = 2.0
 MAX_EMPTY_SCROLLS = 6
@@ -134,22 +142,32 @@ async def run_scrape(
     advertiser_url: str,
     output_file: Path,
     on_progress: Callable[[int, int, str], Awaitable[None]] | None = None,
+    on_status: Callable[[str], Awaitable[None]] | None = None,
 ) -> Path:
     """
     Main entry point dùng từ API hoặc CLI.
     on_progress(current, total, creative_id) được gọi sau mỗi ad.
+    on_status(message) được gọi để cập nhật trạng thái chi tiết.
     Trả về path của file Excel.
     """
+    async def status(msg: str):
+        log.info(msg)
+        if on_status:
+            await on_status(msg)
+
     async with async_playwright() as pw:
+        await status("Đang khởi động trình duyệt...")
         browser = await pw.chromium.launch(headless=True, args=BROWSER_ARGS)
 
         # Bước 1: Thu thập link
+        await status("Đang mở trang advertiser...")
         ctx0 = await browser.new_context(
             locale="vi-VN", user_agent=USER_AGENT,
             viewport={"width": 1440, "height": 900},
         )
         page0 = await ctx0.new_page()
         await page0.goto(advertiser_url, wait_until="domcontentloaded", timeout=60_000)
+        await status("Trang đã load, đang chờ quảng cáo xuất hiện...")
 
         try:
             await page0.wait_for_selector("creative-preview", timeout=30_000)
@@ -157,10 +175,12 @@ async def run_scrape(
             await browser.close()
             raise RuntimeError("Không tìm thấy quảng cáo nào. Kiểm tra lại URL.")
 
+        await status("Đang scroll thu thập danh sách quảng cáo...")
         hrefs = await scroll_and_collect_links(page0)
         await ctx0.close()
 
         total = len(hrefs)
+        await status(f"Tìm thấy {total} quảng cáo. Bắt đầu scrape chi tiết...")
 
         # Bước 2: Scrape từng creative
         rows = []
@@ -171,6 +191,7 @@ async def run_scrape(
             if on_progress:
                 await on_progress(i - 1, total, cid_str)
 
+            log.info(f"[{i}/{total}] Scraping {cid_str}...")
             data = await scrape_creative(browser, href)
             rows.append(data)
 
