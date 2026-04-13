@@ -5,6 +5,7 @@ Chạy: uvicorn main:app --host 0.0.0.0 --port 8000
 
 import asyncio
 import json
+import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -25,6 +26,9 @@ JOBS_FILE = OUTPUTS_DIR / "jobs.json"
 
 # job_id → { status, progress, total, message, file, error }
 jobs: dict[str, dict] = {}
+
+# job_id → threading.Event (set = yêu cầu huỷ)
+cancel_events: dict[str, threading.Event] = {}
 
 
 def _load_jobs():
@@ -69,6 +73,7 @@ async def start_scrape(req: ScrapeRequest):
         "file": None,
         "error": None,
     }
+    cancel_events[job_id] = threading.Event()
 
     asyncio.create_task(_run_job(job_id, req.url))
     return {"job_id": job_id}
@@ -99,15 +104,31 @@ async def download_file(job_id: str):
     )
 
 
+@app.post("/api/cancel/{job_id}")
+async def cancel_job(job_id: str):
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job không tồn tại.")
+    if job["status"] != "running":
+        raise HTTPException(400, "Job không đang chạy.")
+    event = cancel_events.get(job_id)
+    if event:
+        event.set()
+    job["status"] = "cancelled"
+    job["message"] = "Đã huỷ."
+    _save_jobs()
+    return {"ok": True}
+
+
 # ── Background job ────────────────────────────────────────────────────────────
 
 async def _run_job(job_id: str, url: str):
     job = jobs[job_id]
     output_file = OUTPUTS_DIR / f"{job_id}.xlsx"
 
+    cancel_event = cancel_events.get(job_id)
+
     def _in_thread():
-        """Chạy Playwright trong thread riêng với event loop riêng,
-        tránh block event loop của uvicorn."""
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
@@ -121,9 +142,12 @@ async def _run_job(job_id: str, url: str):
             job["message"] = message
             _save_jobs()
 
+        def should_cancel() -> bool:
+            return cancel_event is not None and cancel_event.is_set()
+
         try:
             return loop.run_until_complete(
-                run_scrape(url, output_file, on_progress, on_status)
+                run_scrape(url, output_file, on_progress, on_status, should_cancel)
             )
         finally:
             loop.close()
@@ -131,14 +155,17 @@ async def _run_job(job_id: str, url: str):
     try:
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(_thread_pool, _in_thread)
-        job["status"] = "done"
-        job["file"] = str(output_file)
-        job["message"] = f"Hoàn tất {job['total']} quảng cáo."
+        if job["status"] != "cancelled":
+            job["status"] = "done"
+            job["file"] = str(output_file)
+            job["message"] = f"Hoàn tất {job['total']} quảng cáo."
     except Exception as e:
-        job["status"] = "error"
-        job["error"] = str(e)
-        job["message"] = f"Lỗi: {e}"
+        if job["status"] != "cancelled":
+            job["status"] = "error"
+            job["error"] = str(e)
+            job["message"] = f"Lỗi: {e}"
     finally:
+        cancel_events.pop(job_id, None)
         _save_jobs()
 
 

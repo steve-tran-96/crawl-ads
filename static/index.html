@@ -85,6 +85,15 @@
     }
     #scrapeBtn:hover:not(:disabled) { background: #4338ca; }
 
+    #cancelBtn {
+      background: #fff;
+      color: #dc2626;
+      border: 1.5px solid #fca5a5;
+      margin-top: 12px;
+      width: 100%;
+    }
+    #cancelBtn:hover:not(:disabled) { background: #fef2f2; }
+
     /* Progress section */
     #progressSection {
       display: none;
@@ -228,6 +237,7 @@
       <div class="spinner" id="spinner"></div>
       <span id="statusMsg">Đang khởi động trình duyệt…</span>
     </div>
+    <button id="cancelBtn" onclick="cancelScrape()">Huỷ</button>
   </div>
 
   <!-- Done -->
@@ -347,6 +357,23 @@
     document.getElementById('progressSection').style.display = name === 'progress' ? 'block' : 'none';
     document.getElementById('doneSection').style.display     = name === 'done'     ? 'block' : 'none';
     document.getElementById('errorSection').style.display   = name === 'error'    ? 'block' : 'none';
+    if (name !== 'progress') {
+      document.getElementById('cancelBtn').disabled = false;
+    }
+  }
+
+  async function cancelScrape() {
+    if (!jobId) return;
+    document.getElementById('cancelBtn').disabled = true;
+    try {
+      await fetch(`/api/cancel/${jobId}`, { method: 'POST' });
+    } catch (e) {}
+    clearInterval(pollTimer);
+    localStorage.removeItem('jobId');
+    jobId = null;
+    setSection('none');
+    document.getElementById('scrapeBtn').disabled = false;
+    document.getElementById('urlInput').value = '';
   }
 
   function showError(msg) {

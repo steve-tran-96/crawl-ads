@@ -80,6 +80,10 @@ async def scroll_and_collect_links(page) -> list[str]:
             no_change += 1
             log.info(f"Scroll y={scroll_y}: không mới ({no_change}/{MAX_EMPTY_SCROLLS})")
 
+        if cancelled():
+            log.info("Huỷ trong lúc scroll.")
+            break
+
         scroll_height = await page.evaluate("document.body.scrollHeight")
         if scroll_height == prev_scroll_height and no_change >= 3:
             log.info(f"Trang ngừng load thêm. Tổng: {len(seen)} quảng cáo.")
@@ -168,6 +172,7 @@ async def run_scrape(
     output_file: Path,
     on_progress: Callable[[int, int, str], Awaitable[None]] | None = None,
     on_status: Callable[[str], Awaitable[None]] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> Path:
     """
     Main entry point dùng từ API hoặc CLI.
@@ -175,6 +180,9 @@ async def run_scrape(
     on_status(message) được gọi để cập nhật trạng thái chi tiết.
     Trả về path của file Excel.
     """
+    def cancelled() -> bool:
+        return should_cancel is not None and should_cancel()
+
     async def status(msg: str):
         log.info(msg)
         if on_status:
@@ -219,6 +227,10 @@ async def run_scrape(
         # Bước 2: Scrape từng creative
         rows = []
         for i, href in enumerate(hrefs, 1):
+            if cancelled():
+                log.info(f"Huỷ tại creative {i}/{total}.")
+                break
+
             cid = re.search(r"creative/(CR[A-Za-z0-9]+)", href)
             cid_str = cid.group(1) if cid else "?"
 
