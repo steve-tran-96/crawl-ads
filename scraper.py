@@ -19,9 +19,10 @@ logging.basicConfig(
 )
 log = logging.getLogger("scraper")
 
-SCROLL_PAUSE      = 2.0
-MAX_EMPTY_SCROLLS = 6
+SCROLL_PAUSE      = 2.5   # chờ sau mỗi lần scroll
+MAX_EMPTY_SCROLLS = 8     # dừng sau 8 lần scroll không có item mới
 PAGE_WAIT         = 8
+SCROLL_STEP       = 800   # scroll từng bước (px) thay vì nhảy xuống đáy
 
 BROWSER_ARGS = [
     "--no-sandbox",
@@ -50,6 +51,7 @@ def yt_link(video_id: str | None) -> str:
 async def scroll_and_collect_links(page) -> list[str]:
     seen: set[str] = set()
     no_change = 0
+    scroll_y = 0
     while no_change < MAX_EMPTY_SCROLLS:
         cards = await page.query_selector_all("creative-preview a[href]")
         hrefs = set()
@@ -61,9 +63,12 @@ async def scroll_and_collect_links(page) -> list[str]:
         if new:
             seen.update(new)
             no_change = 0
+            log.info(f"Scroll: tìm thấy {len(seen)} quảng cáo (+{len(new)} mới)")
         else:
             no_change += 1
-        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            log.info(f"Scroll: không có item mới ({no_change}/{MAX_EMPTY_SCROLLS})")
+        scroll_y += SCROLL_STEP
+        await page.evaluate(f"window.scrollTo(0, {scroll_y})")
         await asyncio.sleep(SCROLL_PAUSE)
     return sorted(seen)
 
