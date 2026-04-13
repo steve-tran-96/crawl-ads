@@ -48,7 +48,7 @@ def yt_link(video_id: str | None) -> str:
     return f"https://www.youtube.com/watch?v={video_id}" if video_id else ""
 
 
-async def scroll_and_collect_links(page) -> list[str]:
+async def scroll_and_collect_links(page, cancelled=None) -> list[str]:
     seen: set[str] = set()
     no_change = 0
     scroll_y = 0
@@ -80,7 +80,7 @@ async def scroll_and_collect_links(page) -> list[str]:
             no_change += 1
             log.info(f"Scroll y={scroll_y}: không mới ({no_change}/{MAX_EMPTY_SCROLLS})")
 
-        if cancelled():
+        if cancelled and cancelled():
             log.info("Huỷ trong lúc scroll.")
             break
 
@@ -218,7 +218,7 @@ async def run_scrape(
             )
 
         await status("Đang scroll thu thập danh sách quảng cáo...")
-        hrefs = await scroll_and_collect_links(page0)
+        hrefs = await scroll_and_collect_links(page0, cancelled)
         await ctx0.close()
 
         total = len(hrefs)
