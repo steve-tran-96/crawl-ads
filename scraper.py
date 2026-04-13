@@ -19,10 +19,10 @@ logging.basicConfig(
 )
 log = logging.getLogger("scraper")
 
-SCROLL_PAUSE      = 2.5   # chờ sau mỗi lần scroll
-MAX_EMPTY_SCROLLS = 8     # dừng sau 8 lần scroll không có item mới
+SCROLL_PAUSE      = 1.0   # buffer sau networkidle
+MAX_EMPTY_SCROLLS = 6
 PAGE_WAIT         = 8
-SCROLL_STEP       = 800   # scroll từng bước (px) thay vì nhảy xuống đáy
+SCROLL_STEP       = 600   # nhỏ hơn để không bỏ qua trigger point lazy load
 
 BROWSER_ARGS = [
     "--no-sandbox",
@@ -55,6 +55,16 @@ async def scroll_and_collect_links(page) -> list[str]:
     prev_scroll_height = 0
 
     while no_change < MAX_EMPTY_SCROLLS:
+        scroll_y += SCROLL_STEP
+        await page.evaluate(f"window.scrollTo(0, {scroll_y})")
+
+        # Chờ network load xong batch mới (quan trọng hơn sleep cố định)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=4000)
+        except Exception:
+            pass
+        await asyncio.sleep(SCROLL_PAUSE)
+
         cards = await page.query_selector_all("creative-preview a[href]")
         hrefs = set()
         for c in cards:
@@ -65,16 +75,11 @@ async def scroll_and_collect_links(page) -> list[str]:
         if new:
             seen.update(new)
             no_change = 0
-            log.info(f"Scroll: tìm thấy {len(seen)} quảng cáo (+{len(new)} mới)")
+            log.info(f"Scroll y={scroll_y}: tìm thấy {len(seen)} (+{len(new)} mới)")
         else:
             no_change += 1
-            log.info(f"Scroll: không có item mới ({no_change}/{MAX_EMPTY_SCROLLS})")
+            log.info(f"Scroll y={scroll_y}: không mới ({no_change}/{MAX_EMPTY_SCROLLS})")
 
-        scroll_y += SCROLL_STEP
-        await page.evaluate(f"window.scrollTo(0, {scroll_y})")
-        await asyncio.sleep(SCROLL_PAUSE)
-
-        # Nếu trang không tăng thêm chiều cao (không load thêm) → thoát sớm
         scroll_height = await page.evaluate("document.body.scrollHeight")
         if scroll_height == prev_scroll_height and no_change >= 3:
             log.info(f"Trang ngừng load thêm. Tổng: {len(seen)} quảng cáo.")
