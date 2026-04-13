@@ -104,6 +104,15 @@ async def download_file(job_id: str):
     )
 
 
+@app.get("/api/jobs")
+async def list_jobs():
+    return {
+        job_id: job
+        for job_id, job in jobs.items()
+        if job["status"] == "running"
+    }
+
+
 @app.post("/api/cancel/{job_id}")
 async def cancel_job(job_id: str):
     job = jobs.get(job_id)
