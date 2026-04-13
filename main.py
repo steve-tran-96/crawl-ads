@@ -6,6 +6,7 @@ Chạy: uvicorn main:app --host 0.0.0.0 --port 8000
 import asyncio
 import json
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -42,6 +43,8 @@ def _save_jobs():
 
 
 _load_jobs()
+
+_thread_pool = ThreadPoolExecutor(max_workers=2)
 
 
 # ── Models ────────────────────────────────────────────────────────────────────
@@ -102,18 +105,32 @@ async def _run_job(job_id: str, url: str):
     job = jobs[job_id]
     output_file = OUTPUTS_DIR / f"{job_id}.xlsx"
 
-    async def on_progress(current: int, total: int, cid: str):
-        job["progress"] = current
-        job["total"] = total
-        job["message"] = f"[{current}/{total}] Đang xử lý {cid}…"
-        _save_jobs()
+    def _in_thread():
+        """Chạy Playwright trong thread riêng với event loop riêng,
+        tránh block event loop của uvicorn."""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
 
-    async def on_status(message: str):
-        job["message"] = message
-        _save_jobs()
+        async def on_progress(current: int, total: int, cid: str):
+            job["progress"] = current
+            job["total"] = total
+            job["message"] = f"[{current}/{total}] Đang xử lý {cid}…"
+            _save_jobs()
+
+        async def on_status(message: str):
+            job["message"] = message
+            _save_jobs()
+
+        try:
+            return loop.run_until_complete(
+                run_scrape(url, output_file, on_progress, on_status)
+            )
+        finally:
+            loop.close()
 
     try:
-        await run_scrape(url, output_file, on_progress, on_status)
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(_thread_pool, _in_thread)
         job["status"] = "done"
         job["file"] = str(output_file)
         job["message"] = f"Hoàn tất {job['total']} quảng cáo."
