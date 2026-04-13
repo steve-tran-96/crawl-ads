@@ -1,8 +1,16 @@
 services:
-  app:
-    build: .
+  crawl-ads:
+    container_name: crawl-ads
+    restart: unless-stopped
     ports:
       - "8000:8000"
+    environment:
+      PYTHONUNBUFFERED: "1"
+      PORT: "8000"
+    env_file:
+      - .env
+    build:
+      context: .
+      dockerfile: Dockerfile
     volumes:
       - ./outputs:/app/outputs
-    restart: unless-stopped
