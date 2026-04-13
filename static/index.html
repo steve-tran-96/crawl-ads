@@ -297,6 +297,11 @@
     if (!jobId) return;
     try {
       const res = await fetch(`/api/status/${jobId}`);
+      if (res.status === 404) {
+        clearInterval(pollTimer);
+        showError('Job không còn tồn tại (server có thể đã restart). Vui lòng thử lại.');
+        return;
+      }
       const job = await res.json();
 
       const pct = job.total > 0 ? (job.progress / job.total) * 100 : 0;

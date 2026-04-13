@@ -4,6 +4,7 @@ Chạy: uvicorn main:app --host 0.0.0.0 --port 8000
 """
 
 import asyncio
+import json
 import uuid
 from pathlib import Path
 
@@ -19,8 +20,28 @@ app = FastAPI(title="Google Ads Scraper API")
 OUTPUTS_DIR = Path(__file__).parent / "outputs"
 OUTPUTS_DIR.mkdir(exist_ok=True)
 
+JOBS_FILE = OUTPUTS_DIR / "jobs.json"
+
 # job_id → { status, progress, total, message, file, error }
 jobs: dict[str, dict] = {}
+
+
+def _load_jobs():
+    if JOBS_FILE.exists():
+        try:
+            jobs.update(json.loads(JOBS_FILE.read_text()))
+        except Exception:
+            pass
+
+
+def _save_jobs():
+    try:
+        JOBS_FILE.write_text(json.dumps(jobs))
+    except Exception:
+        pass
+
+
+_load_jobs()
 
 
 # ── Models ────────────────────────────────────────────────────────────────────
@@ -85,9 +106,11 @@ async def _run_job(job_id: str, url: str):
         job["progress"] = current
         job["total"] = total
         job["message"] = f"[{current}/{total}] Đang xử lý {cid}…"
+        _save_jobs()
 
     async def on_status(message: str):
         job["message"] = message
+        _save_jobs()
 
     try:
         await run_scrape(url, output_file, on_progress, on_status)
@@ -98,6 +121,8 @@ async def _run_job(job_id: str, url: str):
         job["status"] = "error"
         job["error"] = str(e)
         job["message"] = f"Lỗi: {e}"
+    finally:
+        _save_jobs()
 
 
 # ── Serve Frontend (PHẢI đặt cuối cùng) ──────────────────────────────────────
