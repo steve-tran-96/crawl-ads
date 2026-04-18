@@ -102,7 +102,25 @@ def extract_creative_hrefs_from_rpc(payload: dict, advertiser_url: str) -> list[
     return hrefs
 
 
-async def scroll_and_collect_links(page, advertiser_url: str, cancelled=None) -> list[str]:
+async def wait_for_ads_frame(page, timeout_ms: int = 30_000):
+    deadline = time.monotonic() + (timeout_ms / 1000)
+    last_urls: set[str] = set()
+    while time.monotonic() < deadline:
+        for frame in page.frames:
+            url = frame.url or ""
+            if "/adframe" in url:
+                log.info("Đã phát hiện ads frame: %s", url)
+                return frame
+            if url:
+                last_urls.add(url)
+        await asyncio.sleep(0.25)
+    raise RuntimeError(
+        "Không tìm thấy iframe /adframe. Frames hiện có: "
+        + ", ".join(sorted(last_urls)[:8])
+    )
+
+
+async def scroll_and_collect_links(page, ads_frame, advertiser_url: str, cancelled=None) -> list[str]:
     seen: set[str] = set()
     no_change = 0
     last_growth_at = time.monotonic()
@@ -124,7 +142,7 @@ async def scroll_and_collect_links(page, advertiser_url: str, cancelled=None) ->
         return len(new)
 
     async def collect_visible_hrefs() -> set[str]:
-        cards = await page.query_selector_all("creative-preview a[href]")
+        cards = await ads_frame.query_selector_all("creative-preview a[href]")
         hrefs = set()
         for c in cards:
             href = await c.get_attribute("href")
@@ -133,7 +151,7 @@ async def scroll_and_collect_links(page, advertiser_url: str, cancelled=None) ->
         return hrefs
 
     async def get_scroll_metrics() -> dict:
-        return await page.evaluate(
+        return await ads_frame.evaluate(
             """
             () => {
               const creativeSelector = 'creative-preview a[href*="/creative/"]';
@@ -179,7 +197,7 @@ async def scroll_and_collect_links(page, advertiser_url: str, cancelled=None) ->
         )
 
     async def scroll_forward(step: int) -> dict:
-        return await page.evaluate(
+        return await ads_frame.evaluate(
             """
             (step) => {
               const creativeSelector = 'creative-preview a[href*="/creative/"]';
@@ -251,7 +269,7 @@ async def scroll_and_collect_links(page, advertiser_url: str, cancelled=None) ->
         pending_response_tasks.add(task)
         task.add_done_callback(pending_response_tasks.discard)
 
-    page.on("response", on_response)
+    page.context.on("response", on_response)
 
     initial_hrefs = await collect_visible_hrefs()
     if initial_hrefs:
@@ -332,7 +350,7 @@ async def scroll_and_collect_links(page, advertiser_url: str, cancelled=None) ->
     finally:
         if pending_response_tasks:
             await asyncio.gather(*pending_response_tasks, return_exceptions=True)
-        page.remove_listener("response", on_response)
+        page.context.remove_listener("response", on_response)
 
     log.info(f"Kết thúc scroll. Tổng: {len(seen)} quảng cáo.")
     return sorted(seen)
@@ -444,10 +462,11 @@ async def run_scrape(
         )
         page0 = await ctx0.new_page()
         await page0.goto(advertiser_url, wait_until="domcontentloaded", timeout=60_000)
+        ads_frame = await wait_for_ads_frame(page0)
         await status("Trang đã load, đang chờ quảng cáo xuất hiện...")
 
         try:
-            await page0.wait_for_selector("creative-preview", timeout=30_000)
+            await ads_frame.wait_for_selector("creative-preview", timeout=30_000)
         except PlaywrightTimeout:
             page_title = await page0.title()
             page_url = page0.url
@@ -462,7 +481,7 @@ async def run_scrape(
             )
 
         await status("Đang scroll thu thập danh sách quảng cáo...")
-        hrefs = await scroll_and_collect_links(page0, advertiser_url, cancelled)
+        hrefs = await scroll_and_collect_links(page0, ads_frame, advertiser_url, cancelled)
         await ctx0.close()
 
         total = len(hrefs)
