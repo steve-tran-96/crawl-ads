@@ -11,7 +11,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Callable, Awaitable
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import pandas as pd
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
@@ -100,6 +100,113 @@ def extract_creative_hrefs_from_rpc(payload: dict, advertiser_url: str) -> list[
             )
         )
     return hrefs
+
+
+def extract_next_cursor_from_rpc(payload: dict) -> str | None:
+    cursor = payload.get("4")
+    return cursor if isinstance(cursor, str) and cursor else None
+
+
+def parse_form_body(post_data: str | None) -> dict[str, str]:
+    if not post_data:
+        return {}
+    parsed = parse_qs(post_data, keep_blank_values=True)
+    return {key: values[-1] if values else "" for key, values in parsed.items()}
+
+
+async def fetch_search_creatives_page(page, request_url: str, form_fields: dict[str, str]) -> str:
+    result = await page.evaluate(
+        """
+        async ({ requestUrl, formFields }) => {
+          const body = new URLSearchParams(formFields).toString();
+          const res = await fetch(requestUrl, {
+            method: 'POST',
+            headers: {
+              'content-type': 'application/x-www-form-urlencoded;charset=UTF-8',
+            },
+            credentials: 'include',
+            body,
+          });
+
+          return JSON.stringify({
+            ok: res.ok,
+            status: res.status,
+            text: await res.text(),
+          });
+        }
+        """,
+        {"requestUrl": request_url, "formFields": form_fields},
+    )
+    data = json.loads(result)
+    if not data["ok"]:
+        raise RuntimeError(
+            f"SearchCreatives RPC lỗi HTTP {data['status']} khi phân trang."
+        )
+    return data["text"]
+
+
+async def collect_links_via_rpc(
+    page,
+    advertiser_url: str,
+    initial_response,
+    cancelled=None,
+) -> list[str]:
+    seen: set[str] = set()
+    first_payload = decode_search_creatives_response(await initial_response.text())
+    first_hrefs = extract_creative_hrefs_from_rpc(first_payload, advertiser_url)
+    if first_hrefs:
+        seen.update(first_hrefs)
+        log.info("RPC SearchCreatives #1: tổng %s quảng cáo (+%s mới)", len(seen), len(first_hrefs))
+
+    form_fields = parse_form_body(initial_response.request.post_data)
+    if "f.req" not in form_fields:
+        raise RuntimeError("Không đọc được f.req từ SearchCreatives request đầu tiên.")
+
+    request_payload = json.loads(form_fields["f.req"])
+    if not isinstance(request_payload, dict):
+        raise RuntimeError("f.req của SearchCreatives không đúng định dạng mong đợi.")
+
+    next_cursor = extract_next_cursor_from_rpc(first_payload)
+    seen_cursors: set[str] = set()
+    page_index = 1
+
+    while next_cursor:
+        if cancelled and cancelled():
+            log.info("Huỷ trong lúc phân trang RPC.")
+            break
+
+        if next_cursor in seen_cursors:
+            log.info("Cursor SearchCreatives lặp lại, dừng tại %s quảng cáo.", len(seen))
+            break
+        seen_cursors.add(next_cursor)
+
+        request_payload["4"] = next_cursor
+        form_fields["f.req"] = json.dumps(request_payload, separators=(",", ":"))
+
+        page_index += 1
+        response_text = await fetch_search_creatives_page(
+            page=page,
+            request_url=initial_response.url,
+            form_fields=form_fields,
+        )
+        payload = decode_search_creatives_response(response_text)
+        hrefs = extract_creative_hrefs_from_rpc(payload, advertiser_url)
+        new = [href for href in hrefs if href not in seen]
+        if new:
+            seen.update(new)
+        log.info(
+            "RPC SearchCreatives #%s: tổng %s quảng cáo (+%s mới)",
+            page_index,
+            len(seen),
+            len(new),
+        )
+
+        next_cursor = extract_next_cursor_from_rpc(payload)
+        if not new and not next_cursor:
+            break
+
+    log.info("Kết thúc phân trang RPC. Tổng: %s quảng cáo.", len(seen))
+    return sorted(seen)
 
 
 async def scroll_and_collect_links(page, advertiser_url: str, cancelled=None) -> list[str]:
@@ -499,6 +606,15 @@ async def run_scrape(
             viewport={"width": 1440, "height": 900},
         )
         page0 = await ctx0.new_page()
+        first_search_rpc = asyncio.create_task(
+            page0.wait_for_response(
+                lambda resp: (
+                    resp.request.method == "POST"
+                    and "SearchService/SearchCreatives" in resp.url
+                ),
+                timeout=60_000,
+            )
+        )
         await page0.goto(advertiser_url, wait_until="domcontentloaded", timeout=60_000)
         await status("Trang đã load, đang chờ quảng cáo xuất hiện...")
 
@@ -517,8 +633,18 @@ async def run_scrape(
                 f"Nội dung: {body_text[:200]}"
             )
 
-        await status("Đang scroll thu thập danh sách quảng cáo...")
-        hrefs = await scroll_and_collect_links(page0, advertiser_url, cancelled)
+        await status("Đang thu thập danh sách quảng cáo qua SearchCreatives RPC...")
+        try:
+            initial_rpc_response = await first_search_rpc
+            hrefs = await collect_links_via_rpc(
+                page=page0,
+                advertiser_url=advertiser_url,
+                initial_response=initial_rpc_response,
+                cancelled=cancelled,
+            )
+        except PlaywrightTimeout:
+            await status("Không bắt được SearchCreatives RPC, chuyển sang chế độ scroll fallback...")
+            hrefs = await scroll_and_collect_links(page0, advertiser_url, cancelled)
         await ctx0.close()
 
         total = len(hrefs)
