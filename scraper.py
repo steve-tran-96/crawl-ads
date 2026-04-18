@@ -183,6 +183,10 @@ async def scroll_and_collect_links(page, advertiser_url: str, cancelled=None) ->
                 useWindow,
                 tagName: best.tagName || 'DOCUMENT',
                 className: useWindow ? '' : (best.className || ''),
+                left: useWindow ? 0 : best.getBoundingClientRect().left,
+                top: useWindow ? 0 : best.getBoundingClientRect().top,
+                width: useWindow ? window.innerWidth : best.getBoundingClientRect().width,
+                height: useWindow ? window.innerHeight : best.getBoundingClientRect().height,
                 scrollTop: useWindow ? window.scrollY : best.scrollTop,
                 clientHeight: useWindow ? window.innerHeight : best.clientHeight,
                 scrollHeight: best.scrollHeight,
@@ -192,72 +196,89 @@ async def scroll_and_collect_links(page, advertiser_url: str, cancelled=None) ->
         )
 
     async def scroll_forward(step: int) -> dict:
-        return await page.evaluate(
-            """
-            (step) => {
-              const creatives = Array.from(document.querySelectorAll('creative-preview'));
-              const isScrollable = (el) => {
-                if (!(el instanceof HTMLElement)) return false;
-                const style = getComputedStyle(el);
-                const overflowScrollable =
-                  /(auto|scroll|overlay)/.test(style.overflowY) ||
-                  el === document.scrollingElement;
-                return overflowScrollable && el.scrollHeight - el.clientHeight > 120;
-              };
-
-              const pickAncestor = (node) => {
-                let cur = node instanceof HTMLElement ? node.parentElement : null;
-                while (cur) {
-                  if (isScrollable(cur)) return cur;
-                  cur = cur.parentElement;
-                }
-                return document.scrollingElement || document.documentElement;
-              };
-
-              const counts = new Map();
-              for (const creative of creatives) {
-                const owner = pickAncestor(creative);
-                counts.set(owner, (counts.get(owner) || 0) + 1);
-              }
-
-              let best = document.scrollingElement || document.documentElement;
-              let bestCount = -1;
-              for (const [el, count] of counts.entries()) {
-                if (count > bestCount) {
-                  best = el;
-                  bestCount = count;
-                }
-              }
-
-              if (!best) {
-                best = document.scrollingElement || document.documentElement;
-              }
-
-              const useWindow =
-                best === document.body ||
-                best === document.documentElement ||
-                best === document.scrollingElement;
-
-              if (useWindow) {
-                document.dispatchEvent(new WheelEvent('wheel', {deltaY: step, bubbles: true, cancelable: true}));
-                window.scrollTo(0, window.scrollY + step);
-              } else {
-                best.dispatchEvent(new WheelEvent('wheel', {deltaY: step, bubbles: true, cancelable: true}));
-                best.scrollTop += step;
-              }
-
-              return {
-                useWindow,
-                tagName: best.tagName || 'DOCUMENT',
-                className: useWindow ? '' : (best.className || ''),
-                scrollTop: useWindow ? window.scrollY : best.scrollTop,
-                clientHeight: useWindow ? window.innerHeight : best.clientHeight,
-                scrollHeight: best.scrollHeight,
-              };
-            }
-            """,
-            step,
+        metrics_before = await get_scroll_metrics()
+        target_x = max(40, min(metrics_before["left"] + (metrics_before["width"] / 2), 1400))
+        target_y = max(
+            80,
+            min(metrics_before["top"] + min(metrics_before["height"] * 0.8, metrics_before["height"] - 24), 860),
         )
+
+        await page.mouse.move(target_x, target_y)
+        await page.mouse.wheel(0, step)
+        await asyncio.sleep(0.25)
+
+        metrics_after = await get_scroll_metrics()
+        if metrics_after["scrollTop"] == metrics_before["scrollTop"]:
+            metrics_after = await page.evaluate(
+                """
+                (step) => {
+                  const creatives = Array.from(document.querySelectorAll('creative-preview'));
+                  const isScrollable = (el) => {
+                    if (!(el instanceof HTMLElement)) return false;
+                    const style = getComputedStyle(el);
+                    const overflowScrollable =
+                      /(auto|scroll|overlay)/.test(style.overflowY) ||
+                      el === document.scrollingElement;
+                    return overflowScrollable && el.scrollHeight - el.clientHeight > 120;
+                  };
+
+                  const pickAncestor = (node) => {
+                    let cur = node instanceof HTMLElement ? node.parentElement : null;
+                    while (cur) {
+                      if (isScrollable(cur)) return cur;
+                      cur = cur.parentElement;
+                    }
+                    return document.scrollingElement || document.documentElement;
+                  };
+
+                  const counts = new Map();
+                  for (const creative of creatives) {
+                    const owner = pickAncestor(creative);
+                    counts.set(owner, (counts.get(owner) || 0) + 1);
+                  }
+
+                  let best = document.scrollingElement || document.documentElement;
+                  let bestCount = -1;
+                  for (const [el, count] of counts.entries()) {
+                    if (count > bestCount) {
+                      best = el;
+                      bestCount = count;
+                    }
+                  }
+
+                  if (!best) {
+                    best = document.scrollingElement || document.documentElement;
+                  }
+
+                  const useWindow =
+                    best === document.body ||
+                    best === document.documentElement ||
+                    best === document.scrollingElement;
+
+                  if (useWindow) {
+                    window.scrollTo(0, window.scrollY + step);
+                  } else {
+                    best.scrollTop += step;
+                  }
+
+                  return {
+                    useWindow,
+                    tagName: best.tagName || 'DOCUMENT',
+                    className: useWindow ? '' : (best.className || ''),
+                    left: useWindow ? 0 : best.getBoundingClientRect().left,
+                    top: useWindow ? 0 : best.getBoundingClientRect().top,
+                    width: useWindow ? window.innerWidth : best.getBoundingClientRect().width,
+                    height: useWindow ? window.innerHeight : best.getBoundingClientRect().height,
+                    scrollTop: useWindow ? window.scrollY : best.scrollTop,
+                    clientHeight: useWindow ? window.innerHeight : best.clientHeight,
+                    scrollHeight: best.scrollHeight,
+                  };
+                }
+                """,
+                step,
+            )
+
+        return metrics_after
 
     async def process_search_creatives_response(response) -> None:
         nonlocal rpc_count
@@ -290,6 +311,13 @@ async def scroll_and_collect_links(page, advertiser_url: str, cancelled=None) ->
             rpc_event.clear()
             metrics_before = await get_scroll_metrics()
             metrics_after_scroll = await scroll_forward(SCROLL_STEP)
+            log.info(
+                "Wheel target [%s.%s] top %.0f -> %.0f",
+                metrics_after_scroll["tagName"],
+                metrics_after_scroll["className"] or "-",
+                metrics_before["scrollTop"],
+                metrics_after_scroll["scrollTop"],
+            )
 
             try:
                 await page.wait_for_load_state("networkidle", timeout=5000)

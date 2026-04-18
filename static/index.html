@@ -24,6 +24,7 @@
       padding: 40px 44px;
       width: 100%;
       max-width: 640px;
+      position: relative;
     }
 
     .logo {
@@ -197,6 +198,21 @@
       font-size: 11px;
       color: #6b7280;
     }
+
+    .version-badge {
+      position: absolute;
+      right: 18px;
+      bottom: 14px;
+      font-size: 11px;
+      line-height: 1;
+      color: #6b7280;
+      background: #f3f4f6;
+      border: 1px solid #e5e7eb;
+      border-radius: 999px;
+      padding: 6px 10px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      letter-spacing: .02em;
+    }
   </style>
 </head>
 <body>
@@ -264,6 +280,8 @@
     Ví dụ: <code>https://adstransparency.google.com/advertiser/AR00718079396149198849?region=VN&preset-date=Today</code>
   </p>
 
+  <div class="version-badge" id="versionBadge">v…</div>
+
 </div>
 
 <script>
@@ -272,6 +290,7 @@
 
   // Khi load trang, kiểm tra xem có job cũ đang chạy không
   window.addEventListener('DOMContentLoaded', () => {
+    loadVersion();
     const savedJobId = localStorage.getItem('jobId');
     if (savedJobId) {
       jobId = savedJobId;
@@ -280,6 +299,18 @@
       pollTimer = setInterval(pollStatus, 2000);
     }
   });
+
+  async function loadVersion() {
+    const badge = document.getElementById('versionBadge');
+    try {
+      const res = await fetch('/api/version');
+      if (!res.ok) throw new Error('bad response');
+      const data = await res.json();
+      badge.textContent = `v${data.version || 'unknown'}`;
+    } catch (e) {
+      badge.textContent = 'vunknown';
+    }
+  }
 
   async function startScrape() {
     const url = document.getElementById('urlInput').value.trim();

@@ -5,6 +5,7 @@ Chạy: uvicorn main:app --host 0.0.0.0 --port 8000
 
 import asyncio
 import json
+import os
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -23,12 +24,40 @@ OUTPUTS_DIR = Path(__file__).parent / "outputs"
 OUTPUTS_DIR.mkdir(exist_ok=True)
 
 JOBS_FILE = OUTPUTS_DIR / "jobs.json"
+GIT_DIR = Path(__file__).parent / ".git"
 
 # job_id → { status, progress, total, message, file, error }
 jobs: dict[str, dict] = {}
 
 # job_id → threading.Event (set = yêu cầu huỷ)
 cancel_events: dict[str, threading.Event] = {}
+
+
+def _read_git_ref_version() -> str | None:
+    try:
+        head = (GIT_DIR / "HEAD").read_text().strip()
+        if head.startswith("ref: "):
+            ref_name = head[5:]
+            ref_file = GIT_DIR / ref_name
+            if ref_file.exists():
+                return ref_file.read_text().strip()[:7]
+
+            packed_refs = GIT_DIR / "packed-refs"
+            if packed_refs.exists():
+                for line in packed_refs.read_text().splitlines():
+                    if not line or line.startswith("#") or line.startswith("^"):
+                        continue
+                    sha, name = line.split(" ", 1)
+                    if name.strip() == ref_name:
+                        return sha[:7]
+        elif head:
+            return head[:7]
+    except Exception:
+        pass
+    return None
+
+
+APP_VERSION = os.getenv("APP_VERSION") or _read_git_ref_version() or "dev"
 
 
 def _load_jobs():
@@ -112,6 +141,11 @@ async def list_jobs():
         for job_id, job in jobs.items()
         if job["status"] == "running"
     }
+
+
+@app.get("/api/version")
+async def get_version():
+    return {"version": APP_VERSION}
 
 
 @app.post("/api/cancel/{job_id}")
