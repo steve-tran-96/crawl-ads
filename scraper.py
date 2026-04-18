@@ -4,12 +4,14 @@ scraper.py — Core scraping logic (dùng standalone hoặc import từ main.py)
 
 import asyncio
 from dataclasses import dataclass
+import json
 import logging
 import re
 import sys
 import time
 from pathlib import Path
 from typing import Callable, Awaitable
+from urllib.parse import urlsplit
 
 import pandas as pd
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
@@ -62,11 +64,64 @@ def yt_link(video_id: str | None) -> str:
     return f"https://www.youtube.com/watch?v={video_id}" if video_id else ""
 
 
-async def scroll_and_collect_links(page, cancelled=None) -> list[str]:
+def creative_href_from_advertiser_url(
+    advertiser_url: str,
+    advertiser_id: str,
+    creative_id: str,
+) -> str:
+    parsed = urlsplit(advertiser_url)
+    query = f"?{parsed.query}" if parsed.query else ""
+    return f"/advertiser/{advertiser_id}/creative/{creative_id}{query}"
+
+
+def decode_search_creatives_response(text: str) -> dict:
+    payload = text.strip()
+    if payload.startswith(")]}'"):
+        newline = payload.find("\n")
+        if newline != -1:
+            payload = payload[newline + 1 :].lstrip()
+    return json.loads(payload)
+
+
+def extract_creative_hrefs_from_rpc(payload: dict, advertiser_url: str) -> list[str]:
+    hrefs: list[str] = []
+    for item in payload.get("1", []):
+        if not isinstance(item, dict):
+            continue
+        advertiser_id = item.get("1")
+        creative_id = item.get("2")
+        if not advertiser_id or not creative_id:
+            continue
+        hrefs.append(
+            creative_href_from_advertiser_url(
+                advertiser_url=advertiser_url,
+                advertiser_id=advertiser_id,
+                creative_id=creative_id,
+            )
+        )
+    return hrefs
+
+
+async def scroll_and_collect_links(page, advertiser_url: str, cancelled=None) -> list[str]:
     seen: set[str] = set()
     no_change = 0
     last_growth_at = time.monotonic()
     bottom_hits = 0
+    rpc_count = 0
+    pending_response_tasks: set[asyncio.Task] = set()
+    response_lock = asyncio.Lock()
+    rpc_event = asyncio.Event()
+
+    async def add_hrefs(hrefs: list[str], source: str) -> int:
+        nonlocal last_growth_at
+        new = [href for href in hrefs if href not in seen]
+        if not new:
+            return 0
+        seen.update(new)
+        last_growth_at = time.monotonic()
+        rpc_event.set()
+        log.info("%s: tổng %s quảng cáo (+%s mới)", source, len(seen), len(new))
+        return len(new)
 
     async def collect_visible_hrefs() -> set[str]:
         cards = await page.query_selector_all("creative-preview a[href]")
@@ -176,80 +231,108 @@ async def scroll_and_collect_links(page, cancelled=None) -> list[str]:
             step,
         )
 
+    async def process_search_creatives_response(response) -> None:
+        nonlocal rpc_count
+        try:
+            payload = decode_search_creatives_response(await response.text())
+            hrefs = extract_creative_hrefs_from_rpc(payload, advertiser_url)
+            async with response_lock:
+                rpc_count += 1
+                await add_hrefs(hrefs, f"RPC SearchCreatives #{rpc_count}")
+        except Exception as exc:
+            log.warning("Không parse được SearchCreatives response: %s", exc)
+
+    def on_response(response) -> None:
+        if response.request.method != "POST":
+            return
+        if "SearchService/SearchCreatives" not in response.url:
+            return
+        task = asyncio.create_task(process_search_creatives_response(response))
+        pending_response_tasks.add(task)
+        task.add_done_callback(pending_response_tasks.discard)
+
+    page.on("response", on_response)
+
     initial_hrefs = await collect_visible_hrefs()
     if initial_hrefs:
-        seen.update(initial_hrefs)
-        last_growth_at = time.monotonic()
-        log.info("Batch ban đầu: tìm thấy %s quảng cáo.", len(seen))
+        await add_hrefs(sorted(initial_hrefs), "DOM batch ban đầu")
 
-    while no_change < MAX_EMPTY_SCROLLS:
-        metrics_before = await get_scroll_metrics()
-        metrics_after_scroll = await scroll_forward(SCROLL_STEP)
+    try:
+        while no_change < MAX_EMPTY_SCROLLS:
+            rpc_event.clear()
+            metrics_before = await get_scroll_metrics()
+            metrics_after_scroll = await scroll_forward(SCROLL_STEP)
 
-        try:
-            await page.wait_for_load_state("networkidle", timeout=5000)
-        except Exception:
-            pass
-        await asyncio.sleep(SCROLL_PAUSE)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=5000)
+            except Exception:
+                pass
+            await asyncio.sleep(SCROLL_PAUSE)
 
-        found_new_this_round = False
-        wait_deadline = time.monotonic() + PER_SCROLL_TIMEOUT
+            found_new_this_round = False
+            wait_deadline = time.monotonic() + PER_SCROLL_TIMEOUT
 
-        while time.monotonic() < wait_deadline:
-            hrefs = await collect_visible_hrefs()
-            new = hrefs - seen
-            if new:
-                seen.update(new)
-                no_change = 0
-                found_new_this_round = True
-                last_growth_at = time.monotonic()
+            while time.monotonic() < wait_deadline:
+                if cancelled and cancelled():
+                    log.info("Huỷ trong lúc scroll.")
+                    break
+
+                if rpc_event.is_set():
+                    rpc_event.clear()
+                    no_change = 0
+                    found_new_this_round = True
+                    await asyncio.sleep(0.5)
+                    continue
+
+                hrefs = sorted(await collect_visible_hrefs())
+                async with response_lock:
+                    added_from_dom = await add_hrefs(hrefs, "DOM")
+                if added_from_dom:
+                    no_change = 0
+                    found_new_this_round = True
+                    await asyncio.sleep(0.5)
+                    continue
+
+                await asyncio.sleep(0.75)
+
+            if cancelled and cancelled():
+                log.info("Huỷ trong lúc scroll.")
+                break
+
+            if not found_new_this_round:
+                no_change += 1
                 log.info(
-                    "Scroll [%s] top %.0f -> %.0f: tìm thấy %s (+%s mới)",
+                    "Scroll [%s] top %.0f -> %.0f: chưa có ad mới (%s/%s, im lặng %.1fs)",
                     metrics_after_scroll["tagName"],
                     metrics_before["scrollTop"],
                     metrics_after_scroll["scrollTop"],
-                    len(seen),
-                    len(new),
+                    no_change,
+                    MAX_EMPTY_SCROLLS,
+                    time.monotonic() - last_growth_at,
                 )
+
+            metrics_after_wait = await get_scroll_metrics()
+            at_bottom = (
+                metrics_after_wait["scrollTop"] + metrics_after_wait["clientHeight"]
+                >= metrics_after_wait["scrollHeight"] - BOTTOM_EPSILON
+            )
+            if at_bottom:
+                bottom_hits += 1
             else:
-                await asyncio.sleep(0.75)
-                continue
-            await asyncio.sleep(0.75)
+                bottom_hits = 0
 
-        if not found_new_this_round:
-            no_change += 1
-            log.info(
-                "Scroll [%s] top %.0f -> %.0f: chưa có ad mới (%s/%s, im lặng %.1fs)",
-                metrics_after_scroll["tagName"],
-                metrics_before["scrollTop"],
-                metrics_after_scroll["scrollTop"],
-                no_change,
-                MAX_EMPTY_SCROLLS,
-                time.monotonic() - last_growth_at,
-            )
-
-        if cancelled and cancelled():
-            log.info("Huỷ trong lúc scroll.")
-            break
-
-        metrics_after_wait = await get_scroll_metrics()
-        at_bottom = (
-            metrics_after_wait["scrollTop"] + metrics_after_wait["clientHeight"]
-            >= metrics_after_wait["scrollHeight"] - BOTTOM_EPSILON
-        )
-        if at_bottom:
-            bottom_hits += 1
-        else:
-            bottom_hits = 0
-
-        stalled_for = time.monotonic() - last_growth_at
-        if bottom_hits >= 2 and stalled_for >= MAX_STALL_SECONDS:
-            log.info(
-                "Đã chạm cuối vùng scroll và không có ad mới trong %.1fs. Dừng tại %s ads.",
-                stalled_for,
-                len(seen),
-            )
-            break
+            stalled_for = time.monotonic() - last_growth_at
+            if bottom_hits >= 2 and stalled_for >= MAX_STALL_SECONDS:
+                log.info(
+                    "Đã chạm cuối vùng scroll và không có ad mới trong %.1fs. Dừng tại %s ads.",
+                    stalled_for,
+                    len(seen),
+                )
+                break
+    finally:
+        if pending_response_tasks:
+            await asyncio.gather(*pending_response_tasks, return_exceptions=True)
+        page.remove_listener("response", on_response)
 
     log.info(f"Kết thúc scroll. Tổng: {len(seen)} quảng cáo.")
     return sorted(seen)
@@ -379,7 +462,7 @@ async def run_scrape(
             )
 
         await status("Đang scroll thu thập danh sách quảng cáo...")
-        hrefs = await scroll_and_collect_links(page0, cancelled)
+        hrefs = await scroll_and_collect_links(page0, advertiser_url, cancelled)
         await ctx0.close()
 
         total = len(hrefs)
