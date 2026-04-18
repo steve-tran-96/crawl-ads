@@ -102,25 +102,7 @@ def extract_creative_hrefs_from_rpc(payload: dict, advertiser_url: str) -> list[
     return hrefs
 
 
-async def wait_for_ads_frame(page, timeout_ms: int = 30_000):
-    deadline = time.monotonic() + (timeout_ms / 1000)
-    last_urls: set[str] = set()
-    while time.monotonic() < deadline:
-        for frame in page.frames:
-            url = frame.url or ""
-            if "/adframe" in url:
-                log.info("Đã phát hiện ads frame: %s", url)
-                return frame
-            if url:
-                last_urls.add(url)
-        await asyncio.sleep(0.25)
-    raise RuntimeError(
-        "Không tìm thấy iframe /adframe. Frames hiện có: "
-        + ", ".join(sorted(last_urls)[:8])
-    )
-
-
-async def scroll_and_collect_links(page, ads_frame, advertiser_url: str, cancelled=None) -> list[str]:
+async def scroll_and_collect_links(page, advertiser_url: str, cancelled=None) -> list[str]:
     seen: set[str] = set()
     no_change = 0
     last_growth_at = time.monotonic()
@@ -142,7 +124,7 @@ async def scroll_and_collect_links(page, ads_frame, advertiser_url: str, cancell
         return len(new)
 
     async def collect_visible_hrefs() -> set[str]:
-        cards = await ads_frame.query_selector_all("creative-preview a[href]")
+        cards = await page.query_selector_all("creative-preview a[href]")
         hrefs = set()
         for c in cards:
             href = await c.get_attribute("href")
@@ -151,28 +133,40 @@ async def scroll_and_collect_links(page, ads_frame, advertiser_url: str, cancell
         return hrefs
 
     async def get_scroll_metrics() -> dict:
-        return await ads_frame.evaluate(
+        return await page.evaluate(
             """
             () => {
-              const creativeSelector = 'creative-preview a[href*="/creative/"]';
-              const all = [document.scrollingElement, ...document.querySelectorAll('*')];
-              let best = null;
-              let bestScore = -1;
-
-              for (const el of all) {
-                if (!(el instanceof HTMLElement)) continue;
+              const creatives = Array.from(document.querySelectorAll('creative-preview'));
+              const isScrollable = (el) => {
+                if (!(el instanceof HTMLElement)) return false;
                 const style = getComputedStyle(el);
-                const canScroll =
-                  el === document.scrollingElement ||
-                  /(auto|scroll|overlay)/.test(style.overflowY);
-                const scrollable = el.scrollHeight - el.clientHeight > 200;
-                if (!canScroll || !scrollable) continue;
+                const overflowScrollable =
+                  /(auto|scroll|overlay)/.test(style.overflowY) ||
+                  el === document.scrollingElement;
+                return overflowScrollable && el.scrollHeight - el.clientHeight > 120;
+              };
 
-                const matches = el.querySelectorAll(creativeSelector).length;
-                const score = matches * 100000 + (el.scrollHeight - el.clientHeight);
-                if (score > bestScore) {
+              const pickAncestor = (node) => {
+                let cur = node instanceof HTMLElement ? node.parentElement : null;
+                while (cur) {
+                  if (isScrollable(cur)) return cur;
+                  cur = cur.parentElement;
+                }
+                return document.scrollingElement || document.documentElement;
+              };
+
+              const counts = new Map();
+              for (const creative of creatives) {
+                const owner = pickAncestor(creative);
+                counts.set(owner, (counts.get(owner) || 0) + 1);
+              }
+
+              let best = document.scrollingElement || document.documentElement;
+              let bestCount = -1;
+              for (const [el, count] of counts.entries()) {
+                if (count > bestCount) {
                   best = el;
-                  bestScore = score;
+                  bestCount = count;
                 }
               }
 
@@ -188,6 +182,7 @@ async def scroll_and_collect_links(page, ads_frame, advertiser_url: str, cancell
               return {
                 useWindow,
                 tagName: best.tagName || 'DOCUMENT',
+                className: useWindow ? '' : (best.className || ''),
                 scrollTop: useWindow ? window.scrollY : best.scrollTop,
                 clientHeight: useWindow ? window.innerHeight : best.clientHeight,
                 scrollHeight: best.scrollHeight,
@@ -197,28 +192,40 @@ async def scroll_and_collect_links(page, ads_frame, advertiser_url: str, cancell
         )
 
     async def scroll_forward(step: int) -> dict:
-        return await ads_frame.evaluate(
+        return await page.evaluate(
             """
             (step) => {
-              const creativeSelector = 'creative-preview a[href*="/creative/"]';
-              const all = [document.scrollingElement, ...document.querySelectorAll('*')];
-              let best = null;
-              let bestScore = -1;
-
-              for (const el of all) {
-                if (!(el instanceof HTMLElement)) continue;
+              const creatives = Array.from(document.querySelectorAll('creative-preview'));
+              const isScrollable = (el) => {
+                if (!(el instanceof HTMLElement)) return false;
                 const style = getComputedStyle(el);
-                const canScroll =
-                  el === document.scrollingElement ||
-                  /(auto|scroll|overlay)/.test(style.overflowY);
-                const scrollable = el.scrollHeight - el.clientHeight > 200;
-                if (!canScroll || !scrollable) continue;
+                const overflowScrollable =
+                  /(auto|scroll|overlay)/.test(style.overflowY) ||
+                  el === document.scrollingElement;
+                return overflowScrollable && el.scrollHeight - el.clientHeight > 120;
+              };
 
-                const matches = el.querySelectorAll(creativeSelector).length;
-                const score = matches * 100000 + (el.scrollHeight - el.clientHeight);
-                if (score > bestScore) {
+              const pickAncestor = (node) => {
+                let cur = node instanceof HTMLElement ? node.parentElement : null;
+                while (cur) {
+                  if (isScrollable(cur)) return cur;
+                  cur = cur.parentElement;
+                }
+                return document.scrollingElement || document.documentElement;
+              };
+
+              const counts = new Map();
+              for (const creative of creatives) {
+                const owner = pickAncestor(creative);
+                counts.set(owner, (counts.get(owner) || 0) + 1);
+              }
+
+              let best = document.scrollingElement || document.documentElement;
+              let bestCount = -1;
+              for (const [el, count] of counts.entries()) {
+                if (count > bestCount) {
                   best = el;
-                  bestScore = score;
+                  bestCount = count;
                 }
               }
 
@@ -232,14 +239,17 @@ async def scroll_and_collect_links(page, ads_frame, advertiser_url: str, cancell
                 best === document.scrollingElement;
 
               if (useWindow) {
+                document.dispatchEvent(new WheelEvent('wheel', {deltaY: step, bubbles: true, cancelable: true}));
                 window.scrollTo(0, window.scrollY + step);
               } else {
+                best.dispatchEvent(new WheelEvent('wheel', {deltaY: step, bubbles: true, cancelable: true}));
                 best.scrollTop += step;
               }
 
               return {
                 useWindow,
                 tagName: best.tagName || 'DOCUMENT',
+                className: useWindow ? '' : (best.className || ''),
                 scrollTop: useWindow ? window.scrollY : best.scrollTop,
                 clientHeight: useWindow ? window.innerHeight : best.clientHeight,
                 scrollHeight: best.scrollHeight,
@@ -462,11 +472,10 @@ async def run_scrape(
         )
         page0 = await ctx0.new_page()
         await page0.goto(advertiser_url, wait_until="domcontentloaded", timeout=60_000)
-        ads_frame = await wait_for_ads_frame(page0)
         await status("Trang đã load, đang chờ quảng cáo xuất hiện...")
 
         try:
-            await ads_frame.wait_for_selector("creative-preview", timeout=30_000)
+            await page0.wait_for_selector("creative-preview", timeout=30_000)
         except PlaywrightTimeout:
             page_title = await page0.title()
             page_url = page0.url
@@ -481,7 +490,7 @@ async def run_scrape(
             )
 
         await status("Đang scroll thu thập danh sách quảng cáo...")
-        hrefs = await scroll_and_collect_links(page0, ads_frame, advertiser_url, cancelled)
+        hrefs = await scroll_and_collect_links(page0, advertiser_url, cancelled)
         await ctx0.close()
 
         total = len(hrefs)
