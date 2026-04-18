@@ -11,7 +11,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Callable, Awaitable
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 import pandas as pd
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
@@ -23,10 +23,10 @@ logging.basicConfig(
 )
 log = logging.getLogger("scraper")
 
-SCROLL_PAUSE       = 1.0   # buffer sau networkidle
+SCROLL_PAUSE       = 0.35  # buffer sau networkidle
 MAX_EMPTY_SCROLLS  = 12
-MAX_STALL_SECONDS  = 25
-PER_SCROLL_TIMEOUT = 12
+MAX_STALL_SECONDS  = 12
+PER_SCROLL_TIMEOUT = 3
 PAGE_WAIT          = 8
 SCROLL_STEP        = 600   # nhỏ hơn để không bỏ qua trigger point lazy load
 BOTTOM_EPSILON     = 48
@@ -114,45 +114,52 @@ def parse_form_body(post_data: str | None) -> dict[str, str]:
     return {key: values[-1] if values else "" for key, values in parsed.items()}
 
 
-async def fetch_search_creatives_page(page, request_url: str, form_fields: dict[str, str]) -> str:
-    result = await page.evaluate(
-        """
-        async ({ requestUrl, formFields }) => {
-          const body = new URLSearchParams(formFields).toString();
-          const res = await fetch(requestUrl, {
-            method: 'POST',
-            headers: {
-              'content-type': 'application/x-www-form-urlencoded;charset=UTF-8',
-            },
-            credentials: 'include',
-            body,
-          });
+def build_rpc_replay_headers(headers: dict[str, str]) -> dict[str, str]:
+    replay = {}
+    for key, value in headers.items():
+        lowered = key.lower()
+        if lowered in {"content-length", "host", "cookie"}:
+            continue
+        replay[key] = value
 
-          return JSON.stringify({
-            ok: res.ok,
-            status: res.status,
-            text: await res.text(),
-          });
-        }
-        """,
-        {"requestUrl": request_url, "formFields": form_fields},
+    replay.setdefault("content-type", "application/x-www-form-urlencoded;charset=UTF-8")
+    return replay
+
+
+async def fetch_search_creatives_page(
+    page,
+    request_url: str,
+    form_fields: dict[str, str],
+    request_headers: dict[str, str],
+) -> str:
+    response = await page.context.request.post(
+        request_url,
+        headers=build_rpc_replay_headers(request_headers),
+        data=urlencode(form_fields),
+        fail_on_status_code=False,
+        timeout=30_000,
     )
-    data = json.loads(result)
-    if not data["ok"]:
+    try:
+        text = await response.text()
+    finally:
+        await response.dispose()
+
+    if not response.ok:
         raise RuntimeError(
-            f"SearchCreatives RPC lỗi HTTP {data['status']} khi phân trang."
+            f"SearchCreatives RPC lỗi HTTP {response.status} khi phân trang."
         )
-    return data["text"]
+    return text
 
 
 async def collect_links_via_rpc(
     page,
     advertiser_url: str,
     initial_response,
+    initial_payload: dict | None = None,
     cancelled=None,
 ) -> list[str]:
     seen: set[str] = set()
-    first_payload = decode_search_creatives_response(await initial_response.text())
+    first_payload = initial_payload or decode_search_creatives_response(await initial_response.text())
     first_hrefs = extract_creative_hrefs_from_rpc(first_payload, advertiser_url)
     if first_hrefs:
         seen.update(first_hrefs)
@@ -161,6 +168,7 @@ async def collect_links_via_rpc(
     form_fields = parse_form_body(initial_response.request.post_data)
     if "f.req" not in form_fields:
         raise RuntimeError("Không đọc được f.req từ SearchCreatives request đầu tiên.")
+    request_headers = await initial_response.request.all_headers()
 
     request_payload = json.loads(form_fields["f.req"])
     if not isinstance(request_payload, dict):
@@ -188,6 +196,7 @@ async def collect_links_via_rpc(
             page=page,
             request_url=initial_response.url,
             form_fields=form_fields,
+            request_headers=request_headers,
         )
         payload = decode_search_creatives_response(response_text)
         hrefs = extract_creative_hrefs_from_rpc(payload, advertiser_url)
@@ -209,7 +218,12 @@ async def collect_links_via_rpc(
     return sorted(seen)
 
 
-async def scroll_and_collect_links(page, advertiser_url: str, cancelled=None) -> list[str]:
+async def scroll_and_collect_links(
+    page,
+    advertiser_url: str,
+    cancelled=None,
+    initial_hrefs: list[str] | None = None,
+) -> list[str]:
     seen: set[str] = set()
     no_change = 0
     last_growth_at = time.monotonic()
@@ -409,9 +423,12 @@ async def scroll_and_collect_links(page, advertiser_url: str, cancelled=None) ->
 
     page.context.on("response", on_response)
 
-    initial_hrefs = await collect_visible_hrefs()
     if initial_hrefs:
-        await add_hrefs(sorted(initial_hrefs), "DOM batch ban đầu")
+        await add_hrefs(sorted(initial_hrefs), "RPC batch ban đầu")
+
+    visible_hrefs = await collect_visible_hrefs()
+    if visible_hrefs:
+        await add_hrefs(sorted(visible_hrefs), "DOM batch ban đầu")
 
     try:
         while no_change < MAX_EMPTY_SCROLLS:
@@ -637,18 +654,36 @@ async def run_scrape(
             )
 
         await status("Đang thu thập danh sách quảng cáo qua SearchCreatives RPC...")
+        first_rpc_hrefs: list[str] = []
         try:
             if initial_rpc_response is None:
                 raise PlaywrightTimeout("Không bắt được SearchCreatives RPC đầu tiên.")
+            first_payload = decode_search_creatives_response(await initial_rpc_response.text())
+            first_rpc_hrefs = extract_creative_hrefs_from_rpc(first_payload, advertiser_url)
             hrefs = await collect_links_via_rpc(
                 page=page0,
                 advertiser_url=advertiser_url,
                 initial_response=initial_rpc_response,
+                initial_payload=first_payload,
                 cancelled=cancelled,
             )
         except PlaywrightTimeout:
             await status("Không bắt được SearchCreatives RPC, chuyển sang chế độ scroll fallback...")
-            hrefs = await scroll_and_collect_links(page0, advertiser_url, cancelled)
+            hrefs = await scroll_and_collect_links(
+                page0,
+                advertiser_url,
+                cancelled,
+                initial_hrefs=first_rpc_hrefs,
+            )
+        except Exception as exc:
+            log.warning("RPC phân trang lỗi, fallback sang scroll: %s", exc)
+            await status("RPC phân trang lỗi, chuyển sang chế độ scroll fallback...")
+            hrefs = await scroll_and_collect_links(
+                page0,
+                advertiser_url,
+                cancelled,
+                initial_hrefs=first_rpc_hrefs,
+            )
         await ctx0.close()
 
         total = len(hrefs)
