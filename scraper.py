@@ -659,37 +659,20 @@ async def run_scrape(
                 f"Nội dung: {body_text[:200]}"
             )
 
-        await status("Đang thu thập danh sách quảng cáo qua SearchCreatives RPC...")
+        await status("Đang thu thập danh sách quảng cáo từ SearchCreatives...")
         first_rpc_hrefs: list[str] = []
-        try:
-            if initial_rpc_response is None:
-                raise PlaywrightTimeout("Không bắt được SearchCreatives RPC đầu tiên.")
+        if initial_rpc_response is not None:
             first_payload = decode_search_creatives_response(await initial_rpc_response.text())
             first_rpc_hrefs = extract_creative_hrefs_from_rpc(first_payload, advertiser_url)
-            hrefs = await collect_links_via_rpc(
-                page=page0,
-                advertiser_url=advertiser_url,
-                initial_response=initial_rpc_response,
-                initial_payload=first_payload,
-                cancelled=cancelled,
-            )
-        except PlaywrightTimeout:
-            await status("Không bắt được SearchCreatives RPC, chuyển sang chế độ scroll fallback...")
-            hrefs = await scroll_and_collect_links(
-                page0,
-                advertiser_url,
-                cancelled,
-                initial_hrefs=first_rpc_hrefs,
-            )
-        except Exception as exc:
-            log.warning("RPC phân trang lỗi, fallback sang scroll: %s", exc)
-            await status("RPC phân trang lỗi, chuyển sang chế độ scroll fallback...")
-            hrefs = await scroll_and_collect_links(
-                page0,
-                advertiser_url,
-                cancelled,
-                initial_hrefs=first_rpc_hrefs,
-            )
+        else:
+            await status("Không bắt được SearchCreatives ban đầu, tiếp tục bằng cuộn trang...")
+
+        hrefs = await scroll_and_collect_links(
+            page0,
+            advertiser_url,
+            cancelled,
+            initial_hrefs=first_rpc_hrefs,
+        )
         await ctx0.close()
 
         total = len(hrefs)
