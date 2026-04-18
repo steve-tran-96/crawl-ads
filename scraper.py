@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import logging
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Callable, Awaitable
 
@@ -20,10 +21,13 @@ logging.basicConfig(
 )
 log = logging.getLogger("scraper")
 
-SCROLL_PAUSE      = 1.0   # buffer sau networkidle
-MAX_EMPTY_SCROLLS = 6
-PAGE_WAIT         = 8
-SCROLL_STEP       = 600   # nhỏ hơn để không bỏ qua trigger point lazy load
+SCROLL_PAUSE       = 1.0   # buffer sau networkidle
+MAX_EMPTY_SCROLLS  = 12
+MAX_STALL_SECONDS  = 25
+PER_SCROLL_TIMEOUT = 12
+PAGE_WAIT          = 8
+SCROLL_STEP        = 600   # nhỏ hơn để không bỏ qua trigger point lazy load
+BOTTOM_EPSILON     = 48
 
 BROWSER_ARGS = [
     "--no-sandbox",
@@ -61,44 +65,191 @@ def yt_link(video_id: str | None) -> str:
 async def scroll_and_collect_links(page, cancelled=None) -> list[str]:
     seen: set[str] = set()
     no_change = 0
-    scroll_y = 0
-    prev_scroll_height = 0
+    last_growth_at = time.monotonic()
+    bottom_hits = 0
 
-    while no_change < MAX_EMPTY_SCROLLS:
-        scroll_y += SCROLL_STEP
-        await page.evaluate(f"window.scrollTo(0, {scroll_y})")
-
-        # Chờ network load xong batch mới (quan trọng hơn sleep cố định)
-        try:
-            await page.wait_for_load_state("networkidle", timeout=4000)
-        except Exception:
-            pass
-        await asyncio.sleep(SCROLL_PAUSE)
-
+    async def collect_visible_hrefs() -> set[str]:
         cards = await page.query_selector_all("creative-preview a[href]")
         hrefs = set()
         for c in cards:
             href = await c.get_attribute("href")
             if href and "/creative/" in href:
                 hrefs.add(href)
-        new = hrefs - seen
-        if new:
-            seen.update(new)
-            no_change = 0
-            log.info(f"Scroll y={scroll_y}: tìm thấy {len(seen)} (+{len(new)} mới)")
-        else:
+        return hrefs
+
+    async def get_scroll_metrics() -> dict:
+        return await page.evaluate(
+            """
+            () => {
+              const creativeSelector = 'creative-preview a[href*="/creative/"]';
+              const all = [document.scrollingElement, ...document.querySelectorAll('*')];
+              let best = null;
+              let bestScore = -1;
+
+              for (const el of all) {
+                if (!(el instanceof HTMLElement)) continue;
+                const style = getComputedStyle(el);
+                const canScroll =
+                  el === document.scrollingElement ||
+                  /(auto|scroll|overlay)/.test(style.overflowY);
+                const scrollable = el.scrollHeight - el.clientHeight > 200;
+                if (!canScroll || !scrollable) continue;
+
+                const matches = el.querySelectorAll(creativeSelector).length;
+                const score = matches * 100000 + (el.scrollHeight - el.clientHeight);
+                if (score > bestScore) {
+                  best = el;
+                  bestScore = score;
+                }
+              }
+
+              if (!best) {
+                best = document.scrollingElement || document.documentElement;
+              }
+
+              const useWindow =
+                best === document.body ||
+                best === document.documentElement ||
+                best === document.scrollingElement;
+
+              return {
+                useWindow,
+                tagName: best.tagName || 'DOCUMENT',
+                scrollTop: useWindow ? window.scrollY : best.scrollTop,
+                clientHeight: useWindow ? window.innerHeight : best.clientHeight,
+                scrollHeight: best.scrollHeight,
+              };
+            }
+            """
+        )
+
+    async def scroll_forward(step: int) -> dict:
+        return await page.evaluate(
+            """
+            (step) => {
+              const creativeSelector = 'creative-preview a[href*="/creative/"]';
+              const all = [document.scrollingElement, ...document.querySelectorAll('*')];
+              let best = null;
+              let bestScore = -1;
+
+              for (const el of all) {
+                if (!(el instanceof HTMLElement)) continue;
+                const style = getComputedStyle(el);
+                const canScroll =
+                  el === document.scrollingElement ||
+                  /(auto|scroll|overlay)/.test(style.overflowY);
+                const scrollable = el.scrollHeight - el.clientHeight > 200;
+                if (!canScroll || !scrollable) continue;
+
+                const matches = el.querySelectorAll(creativeSelector).length;
+                const score = matches * 100000 + (el.scrollHeight - el.clientHeight);
+                if (score > bestScore) {
+                  best = el;
+                  bestScore = score;
+                }
+              }
+
+              if (!best) {
+                best = document.scrollingElement || document.documentElement;
+              }
+
+              const useWindow =
+                best === document.body ||
+                best === document.documentElement ||
+                best === document.scrollingElement;
+
+              if (useWindow) {
+                window.scrollTo(0, window.scrollY + step);
+              } else {
+                best.scrollTop += step;
+              }
+
+              return {
+                useWindow,
+                tagName: best.tagName || 'DOCUMENT',
+                scrollTop: useWindow ? window.scrollY : best.scrollTop,
+                clientHeight: useWindow ? window.innerHeight : best.clientHeight,
+                scrollHeight: best.scrollHeight,
+              };
+            }
+            """,
+            step,
+        )
+
+    initial_hrefs = await collect_visible_hrefs()
+    if initial_hrefs:
+        seen.update(initial_hrefs)
+        last_growth_at = time.monotonic()
+        log.info("Batch ban đầu: tìm thấy %s quảng cáo.", len(seen))
+
+    while no_change < MAX_EMPTY_SCROLLS:
+        metrics_before = await get_scroll_metrics()
+        metrics_after_scroll = await scroll_forward(SCROLL_STEP)
+
+        try:
+            await page.wait_for_load_state("networkidle", timeout=5000)
+        except Exception:
+            pass
+        await asyncio.sleep(SCROLL_PAUSE)
+
+        found_new_this_round = False
+        wait_deadline = time.monotonic() + PER_SCROLL_TIMEOUT
+
+        while time.monotonic() < wait_deadline:
+            hrefs = await collect_visible_hrefs()
+            new = hrefs - seen
+            if new:
+                seen.update(new)
+                no_change = 0
+                found_new_this_round = True
+                last_growth_at = time.monotonic()
+                log.info(
+                    "Scroll [%s] top %.0f -> %.0f: tìm thấy %s (+%s mới)",
+                    metrics_after_scroll["tagName"],
+                    metrics_before["scrollTop"],
+                    metrics_after_scroll["scrollTop"],
+                    len(seen),
+                    len(new),
+                )
+            else:
+                await asyncio.sleep(0.75)
+                continue
+            await asyncio.sleep(0.75)
+
+        if not found_new_this_round:
             no_change += 1
-            log.info(f"Scroll y={scroll_y}: không mới ({no_change}/{MAX_EMPTY_SCROLLS})")
+            log.info(
+                "Scroll [%s] top %.0f -> %.0f: chưa có ad mới (%s/%s, im lặng %.1fs)",
+                metrics_after_scroll["tagName"],
+                metrics_before["scrollTop"],
+                metrics_after_scroll["scrollTop"],
+                no_change,
+                MAX_EMPTY_SCROLLS,
+                time.monotonic() - last_growth_at,
+            )
 
         if cancelled and cancelled():
             log.info("Huỷ trong lúc scroll.")
             break
 
-        scroll_height = await page.evaluate("document.body.scrollHeight")
-        if scroll_height == prev_scroll_height and no_change >= 3:
-            log.info(f"Trang ngừng load thêm. Tổng: {len(seen)} quảng cáo.")
+        metrics_after_wait = await get_scroll_metrics()
+        at_bottom = (
+            metrics_after_wait["scrollTop"] + metrics_after_wait["clientHeight"]
+            >= metrics_after_wait["scrollHeight"] - BOTTOM_EPSILON
+        )
+        if at_bottom:
+            bottom_hits += 1
+        else:
+            bottom_hits = 0
+
+        stalled_for = time.monotonic() - last_growth_at
+        if bottom_hits >= 2 and stalled_for >= MAX_STALL_SECONDS:
+            log.info(
+                "Đã chạm cuối vùng scroll và không có ad mới trong %.1fs. Dừng tại %s ads.",
+                stalled_for,
+                len(seen),
+            )
             break
-        prev_scroll_height = scroll_height
 
     log.info(f"Kết thúc scroll. Tổng: {len(seen)} quảng cáo.")
     return sorted(seen)
