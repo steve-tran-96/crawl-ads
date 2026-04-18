@@ -606,16 +606,19 @@ async def run_scrape(
             viewport={"width": 1440, "height": 900},
         )
         page0 = await ctx0.new_page()
-        first_search_rpc = asyncio.create_task(
-            page0.wait_for_response(
+        initial_rpc_response = None
+        try:
+            async with page0.expect_response(
                 lambda resp: (
                     resp.request.method == "POST"
                     and "SearchService/SearchCreatives" in resp.url
                 ),
                 timeout=60_000,
-            )
-        )
-        await page0.goto(advertiser_url, wait_until="domcontentloaded", timeout=60_000)
+            ) as first_search_rpc:
+                await page0.goto(advertiser_url, wait_until="domcontentloaded", timeout=60_000)
+            initial_rpc_response = await first_search_rpc.value
+        except PlaywrightTimeout:
+            initial_rpc_response = None
         await status("Trang đã load, đang chờ quảng cáo xuất hiện...")
 
         try:
@@ -635,7 +638,8 @@ async def run_scrape(
 
         await status("Đang thu thập danh sách quảng cáo qua SearchCreatives RPC...")
         try:
-            initial_rpc_response = await first_search_rpc
+            if initial_rpc_response is None:
+                raise PlaywrightTimeout("Không bắt được SearchCreatives RPC đầu tiên.")
             hrefs = await collect_links_via_rpc(
                 page=page0,
                 advertiser_url=advertiser_url,
