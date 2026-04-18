@@ -69,6 +69,7 @@ async def start_scrape(req: ScrapeRequest):
         "status": "running",
         "progress": 0,
         "total": 0,
+        "matched": 0,
         "message": "Đang khởi động...",
         "file": None,
         "error": None,
@@ -163,11 +164,15 @@ async def _run_job(job_id: str, url: str):
 
     try:
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(_thread_pool, _in_thread)
+        result = await loop.run_in_executor(_thread_pool, _in_thread)
         if job["status"] != "cancelled":
             job["status"] = "done"
-            job["file"] = str(output_file)
-            job["message"] = f"Hoàn tất {job['total']} quảng cáo."
+            job["file"] = str(result.output_file)
+            job["matched"] = result.exported_total
+            job["message"] = (
+                f"Hoàn tất. Tìm thấy {result.exported_total} quảng cáo có YouTube ID "
+                f"trên {result.scanned_total} quảng cáo đã quét."
+            )
     except Exception as e:
         if job["status"] != "cancelled":
             job["status"] = "error"

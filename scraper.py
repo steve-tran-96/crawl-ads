@@ -3,6 +3,7 @@ scraper.py — Core scraping logic (dùng standalone hoặc import từ main.py)
 """
 
 import asyncio
+from dataclasses import dataclass
 import logging
 import re
 import sys
@@ -37,6 +38,15 @@ USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
+
+EXPORT_COLUMNS = ["creative_id", "product_name", "landing_page", "youtube_link"]
+
+
+@dataclass
+class ScrapeResult:
+    output_file: Path
+    scanned_total: int
+    exported_total: int
 
 
 def yt_id_from_embed_url(url: str) -> str | None:
@@ -173,12 +183,12 @@ async def run_scrape(
     on_progress: Callable[[int, int, str], Awaitable[None]] | None = None,
     on_status: Callable[[str], Awaitable[None]] | None = None,
     should_cancel: Callable[[], bool] | None = None,
-) -> Path:
+) -> ScrapeResult:
     """
     Main entry point dùng từ API hoặc CLI.
     on_progress(current, total, creative_id) được gọi sau mỗi ad.
     on_status(message) được gọi để cập nhật trạng thái chi tiết.
-    Trả về path của file Excel.
+    Trả về file Excel cùng thống kê số lượng creative đã quét / được xuất.
     """
     def cancelled() -> bool:
         return should_cancel is not None and should_cancel()
@@ -222,7 +232,7 @@ async def run_scrape(
         await ctx0.close()
 
         total = len(hrefs)
-        await status(f"Tìm thấy {total} quảng cáo. Bắt đầu scrape chi tiết...")
+        await status(f"Tìm thấy {total} quảng cáo. Bắt đầu lọc các quảng cáo có YouTube ID...")
 
         # Bước 2: Scrape từng creative
         rows = []
@@ -239,15 +249,17 @@ async def run_scrape(
 
             log.info(f"[{i}/{total}] Scraping {cid_str}...")
             data = await scrape_creative(browser, href)
-            rows.append(data)
+            if data.get("youtube_link"):
+                rows.append(data)
 
             if on_progress:
                 await on_progress(i, total, cid_str)
 
         await browser.close()
+        await status(f"Đã lọc được {len(rows)} quảng cáo có YouTube ID.")
 
     # Bước 3: Xuất Excel
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(rows, columns=EXPORT_COLUMNS)
     df.index = df.index + 1
     df.rename(columns={
         "creative_id": "Creative ID",
@@ -268,7 +280,11 @@ async def run_scrape(
                     cell.hyperlink = cell.value
                     cell.style = "Hyperlink"
 
-    return output_file
+    return ScrapeResult(
+        output_file=output_file,
+        scanned_total=total,
+        exported_total=len(rows),
+    )
 
 
 # ── Chạy standalone ───────────────────────────────────────────────────────────
@@ -283,6 +299,9 @@ if __name__ == "__main__":
         async def progress(cur, total, cid):
             print(f"  [{cur:>3}/{total}] {cid}…", end="\r")
         result = await run_scrape(url, out, progress)
-        print(f"\n✓ Done → {result}")
+        print(
+            f"\n✓ Done → {result.output_file} "
+            f"({result.exported_total}/{result.scanned_total} quảng cáo có YouTube ID)"
+        )
 
     asyncio.run(_cli())

@@ -336,8 +336,9 @@
         clearInterval(pollTimer);
         localStorage.removeItem('jobId');
         setSection('done');
+        const matchedCount = typeof job.matched === 'number' ? job.matched : job.total;
         document.getElementById('doneMsg').textContent =
-          `Đã cào ${job.total} quảng cáo thành công.`;
+          `Đã xuất ${matchedCount} quảng cáo có YouTube ID.`;
         document.getElementById('scrapeBtn').disabled = false;
       } else if (job.status === 'error') {
         clearInterval(pollTimer);
