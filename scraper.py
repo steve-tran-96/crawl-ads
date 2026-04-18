@@ -103,8 +103,14 @@ def extract_creative_hrefs_from_rpc(payload: dict, advertiser_url: str) -> list[
 
 
 def extract_next_cursor_from_rpc(payload: dict) -> str | None:
-    cursor = payload.get("4")
-    return cursor if isinstance(cursor, str) and cursor else None
+    # SearchCreatives trả cursor trang sau ở field "2".
+    # Các field "4"/"5" thường là offset/total dạng số ("700", "800"),
+    # không phải opaque page token để replay request tiếp theo.
+    for key in ("2", "4"):
+        cursor = payload.get(key)
+        if isinstance(cursor, str) and cursor and not cursor.isdigit():
+            return cursor
+    return None
 
 
 def parse_form_body(post_data: str | None) -> dict[str, str]:
