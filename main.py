@@ -66,6 +66,11 @@ def _load_jobs():
     if JOBS_FILE.exists():
         try:
             jobs.update(json.loads(JOBS_FILE.read_text()))
+            for job in jobs.values():
+                if job.get("status") == "running":
+                    job["status"] = "cancelled"
+                    job["message"] = "Job cũ đã bị dừng do server restart."
+                    job["error"] = None
         except Exception:
             pass
 
@@ -78,6 +83,7 @@ def _save_jobs():
 
 
 _load_jobs()
+_save_jobs()
 
 _thread_pool = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_JOBS)
 

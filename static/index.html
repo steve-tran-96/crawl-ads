@@ -324,6 +324,7 @@
   let jobId = null;
   let pollTimer = null;
   let jobsSummaryTimer = null;
+  let pollErrorCount = 0;
 
   // Khi load trang, kiểm tra xem có job cũ đang chạy không
   window.addEventListener('DOMContentLoaded', () => {
@@ -376,6 +377,7 @@
       clearInterval(pollTimer);
       pollTimer = null;
     }
+    pollErrorCount = 0;
 
     // Reset UI
     setSection('progress');
@@ -413,10 +415,14 @@
       const res = await fetch(`/api/status/${jobId}`);
       if (res.status === 404) {
         clearInterval(pollTimer);
+        pollTimer = null;
         localStorage.removeItem('jobId');
+        jobId = null;
+        refreshJobsSummary();
         showError('Job không còn tồn tại (server có thể đã restart). Vui lòng thử lại.');
         return;
       }
+      pollErrorCount = 0;
       const job = await res.json();
 
       const discovered = typeof job.discovered === 'number' ? job.discovered : (job.total || 0);
@@ -457,7 +463,15 @@
         showError(job.error || 'Lỗi không xác định.');
       }
     } catch (e) {
-      // network hiccup, keep polling
+      pollErrorCount += 1;
+      if (pollErrorCount >= 3) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+        localStorage.removeItem('jobId');
+        jobId = null;
+        refreshJobsSummary();
+        showError('Không thể đồng bộ trạng thái job cũ. Vui lòng chạy lại.');
+      }
     }
   }
 
