@@ -343,6 +343,11 @@
       return;
     }
 
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+
     // Reset UI
     setSection('progress');
     document.getElementById('scrapeBtn').disabled = true;
@@ -396,15 +401,26 @@
 
       if (job.status === 'done') {
         clearInterval(pollTimer);
+        pollTimer = null;
         localStorage.removeItem('jobId');
+        jobId = null;
         setSection('done');
         const matchedCount = typeof job.matched === 'number' ? job.matched : job.total;
         document.getElementById('doneMsg').textContent =
           `Đã xuất ${matchedCount} quảng cáo có YouTube ID.`;
         document.getElementById('scrapeBtn').disabled = false;
+      } else if (job.status === 'cancelled') {
+        clearInterval(pollTimer);
+        pollTimer = null;
+        localStorage.removeItem('jobId');
+        jobId = null;
+        setSection('none');
+        document.getElementById('scrapeBtn').disabled = false;
       } else if (job.status === 'error') {
         clearInterval(pollTimer);
+        pollTimer = null;
         localStorage.removeItem('jobId');
+        jobId = null;
         showError(job.error || 'Lỗi không xác định.');
       }
     } catch (e) {
@@ -432,6 +448,7 @@
       await fetch(`/api/cancel/${jobId}`, { method: 'POST' });
     } catch (e) {}
     clearInterval(pollTimer);
+    pollTimer = null;
     localStorage.removeItem('jobId');
     jobId = null;
     setSection('none');
