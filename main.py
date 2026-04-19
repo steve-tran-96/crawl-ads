@@ -32,6 +32,8 @@ jobs: dict[str, dict] = {}
 # job_id → threading.Event (set = yêu cầu huỷ)
 cancel_events: dict[str, threading.Event] = {}
 
+MAX_CONCURRENT_JOBS = 2
+
 
 def _read_git_ref_version() -> str | None:
     try:
@@ -77,7 +79,7 @@ def _save_jobs():
 
 _load_jobs()
 
-_thread_pool = ThreadPoolExecutor(max_workers=2)
+_thread_pool = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_JOBS)
 
 
 # ── Models ────────────────────────────────────────────────────────────────────
@@ -141,6 +143,15 @@ async def list_jobs():
         job_id: job
         for job_id, job in jobs.items()
         if job["status"] == "running"
+    }
+
+
+@app.get("/api/jobs/summary")
+async def jobs_summary():
+    running_count = sum(1 for job in jobs.values() if job["status"] == "running")
+    return {
+        "running_count": running_count,
+        "max_concurrent_jobs": MAX_CONCURRENT_JOBS,
     }
 
 

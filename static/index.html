@@ -52,6 +52,17 @@
       margin-bottom: 24px;
     }
 
+    .jobs-summary {
+      margin: -12px 0 18px;
+      font-size: 12px;
+      color: #6b7280;
+    }
+
+    .jobs-summary strong {
+      color: #111827;
+      font-weight: 700;
+    }
+
     input[type="text"] {
       flex: 1;
       height: 46px;
@@ -259,6 +270,7 @@
     />
     <button id="scrapeBtn" onclick="startScrape()">Scrape</button>
   </div>
+  <div class="jobs-summary">Job đang chạy: <strong id="jobsSummary">0 / 2</strong></div>
 
   <!-- Progress -->
   <div id="progressSection">
@@ -311,10 +323,13 @@
 <script>
   let jobId = null;
   let pollTimer = null;
+  let jobsSummaryTimer = null;
 
   // Khi load trang, kiểm tra xem có job cũ đang chạy không
   window.addEventListener('DOMContentLoaded', () => {
     loadVersion();
+    refreshJobsSummary();
+    jobsSummaryTimer = setInterval(refreshJobsSummary, 2000);
     const savedJobId = localStorage.getItem('jobId');
     if (savedJobId) {
       jobId = savedJobId;
@@ -333,6 +348,20 @@
       badge.textContent = `v${data.version || 'unknown'}`;
     } catch (e) {
       badge.textContent = 'vunknown';
+    }
+  }
+
+  async function refreshJobsSummary() {
+    const summaryEl = document.getElementById('jobsSummary');
+    try {
+      const res = await fetch('/api/jobs/summary');
+      if (!res.ok) throw new Error('bad response');
+      const data = await res.json();
+      const running = typeof data.running_count === 'number' ? data.running_count : 0;
+      const max = typeof data.max_concurrent_jobs === 'number' ? data.max_concurrent_jobs : 0;
+      summaryEl.textContent = `${running} / ${max}`;
+    } catch (e) {
+      summaryEl.textContent = '0 / ?';
     }
   }
 
@@ -371,6 +400,7 @@
       const data = await res.json();
       jobId = data.job_id;
       localStorage.setItem('jobId', jobId);
+      refreshJobsSummary();
       pollTimer = setInterval(pollStatus, 2000);
     } catch (e) {
       showError('Không kết nối được tới server.');
@@ -404,6 +434,7 @@
         pollTimer = null;
         localStorage.removeItem('jobId');
         jobId = null;
+        refreshJobsSummary();
         setSection('done');
         const matchedCount = typeof job.matched === 'number' ? job.matched : job.total;
         document.getElementById('doneMsg').textContent =
@@ -414,6 +445,7 @@
         pollTimer = null;
         localStorage.removeItem('jobId');
         jobId = null;
+        refreshJobsSummary();
         setSection('none');
         document.getElementById('scrapeBtn').disabled = false;
       } else if (job.status === 'error') {
@@ -421,6 +453,7 @@
         pollTimer = null;
         localStorage.removeItem('jobId');
         jobId = null;
+        refreshJobsSummary();
         showError(job.error || 'Lỗi không xác định.');
       }
     } catch (e) {
@@ -451,6 +484,7 @@
     pollTimer = null;
     localStorage.removeItem('jobId');
     jobId = null;
+    refreshJobsSummary();
     setSection('none');
     document.getElementById('scrapeBtn').disabled = false;
     document.getElementById('urlInput').value = '';
