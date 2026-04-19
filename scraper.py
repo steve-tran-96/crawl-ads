@@ -229,6 +229,7 @@ async def scroll_and_collect_links(
     advertiser_url: str,
     cancelled=None,
     initial_hrefs: list[str] | None = None,
+    on_discovered: Callable[[int], Awaitable[None]] | None = None,
 ) -> list[str]:
     seen: set[str] = set()
     no_change = 0
@@ -247,6 +248,8 @@ async def scroll_and_collect_links(
         seen.update(new)
         last_growth_at = time.monotonic()
         rpc_event.set()
+        if on_discovered:
+            await on_discovered(len(seen))
         log.info("%s: tổng %s quảng cáo (+%s mới)", source, len(seen), len(new))
         return len(new)
 
@@ -602,12 +605,16 @@ async def run_scrape(
     output_file: Path,
     on_progress: Callable[[int, int, str], Awaitable[None]] | None = None,
     on_status: Callable[[str], Awaitable[None]] | None = None,
+    on_discovered: Callable[[int], Awaitable[None]] | None = None,
+    on_saved: Callable[[int], Awaitable[None]] | None = None,
     should_cancel: Callable[[], bool] | None = None,
 ) -> ScrapeResult:
     """
     Main entry point dùng từ API hoặc CLI.
     on_progress(current, total, creative_id) được gọi sau mỗi ad.
     on_status(message) được gọi để cập nhật trạng thái chi tiết.
+    on_discovered(count) được gọi khi số quảng cáo đã phát hiện tăng lên.
+    on_saved(count) được gọi khi số quảng cáo có YouTube ID đã lưu tăng lên.
     Trả về file Excel cùng thống kê số lượng creative đã quét / được xuất.
     """
     def cancelled() -> bool:
@@ -672,14 +679,19 @@ async def run_scrape(
             advertiser_url,
             cancelled,
             initial_hrefs=first_rpc_hrefs,
+            on_discovered=on_discovered,
         )
         await ctx0.close()
 
         total = len(hrefs)
+        if on_discovered:
+            await on_discovered(total)
         await status(f"Tìm thấy {total} quảng cáo. Bắt đầu lọc các quảng cáo có YouTube ID...")
 
         # Bước 2: Scrape từng creative
         rows = []
+        if on_saved:
+            await on_saved(0)
         for i, href in enumerate(hrefs, 1):
             if cancelled():
                 log.info(f"Huỷ tại creative {i}/{total}.")
@@ -695,6 +707,8 @@ async def run_scrape(
             data = await scrape_creative(browser, href)
             if data.get("youtube_link"):
                 rows.append(data)
+                if on_saved:
+                    await on_saved(len(rows))
 
             if on_progress:
                 await on_progress(i, total, cid_str)

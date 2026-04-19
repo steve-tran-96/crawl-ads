@@ -98,6 +98,7 @@ async def start_scrape(req: ScrapeRequest):
         "status": "running",
         "progress": 0,
         "total": 0,
+        "discovered": 0,
         "matched": 0,
         "message": "Đang khởi động...",
         "file": None,
@@ -179,6 +180,7 @@ async def _run_job(job_id: str, url: str):
         async def on_progress(current: int, total: int, cid: str):
             job["progress"] = current
             job["total"] = total
+            job["discovered"] = max(job.get("discovered", 0), total)
             job["message"] = f"[{current}/{total}] Đang xử lý {cid}…"
             _save_jobs()
 
@@ -186,12 +188,29 @@ async def _run_job(job_id: str, url: str):
             job["message"] = message
             _save_jobs()
 
+        async def on_discovered(discovered: int):
+            job["discovered"] = discovered
+            job["total"] = max(job.get("total", 0), discovered)
+            _save_jobs()
+
+        async def on_saved(saved: int):
+            job["matched"] = saved
+            _save_jobs()
+
         def should_cancel() -> bool:
             return cancel_event is not None and cancel_event.is_set()
 
         try:
             return loop.run_until_complete(
-                run_scrape(url, output_file, on_progress, on_status, should_cancel)
+                run_scrape(
+                    url,
+                    output_file,
+                    on_progress=on_progress,
+                    on_status=on_status,
+                    on_discovered=on_discovered,
+                    on_saved=on_saved,
+                    should_cancel=should_cancel,
+                )
             )
         finally:
             loop.close()
@@ -202,6 +221,8 @@ async def _run_job(job_id: str, url: str):
         if job["status"] != "cancelled":
             job["status"] = "done"
             job["file"] = str(result.output_file)
+            job["discovered"] = result.scanned_total
+            job["total"] = result.scanned_total
             job["matched"] = result.exported_total
             job["message"] = (
                 f"Hoàn tất. Tìm thấy {result.exported_total} quảng cáo có YouTube ID "

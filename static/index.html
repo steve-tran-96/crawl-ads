@@ -144,6 +144,26 @@
     }
     @keyframes spin { to { transform: rotate(360deg); } }
 
+    .live-stats {
+      display: grid;
+      gap: 6px;
+      margin-top: 12px;
+      padding: 12px 14px;
+      background: #f8fafc;
+      border: 1px solid #e5e7eb;
+      border-radius: 10px;
+    }
+
+    .live-stat {
+      font-size: 12px;
+      color: #4b5563;
+    }
+
+    .live-stat strong {
+      color: #111827;
+      font-weight: 700;
+    }
+
     /* Done state */
     #doneSection {
       display: none;
@@ -253,6 +273,10 @@
       <div class="spinner" id="spinner"></div>
       <span id="statusMsg">Đang khởi động trình duyệt…</span>
     </div>
+    <div class="live-stats">
+      <div class="live-stat">Đã phát hiện: <strong id="detectedCount">0</strong> quảng cáo</div>
+      <div class="live-stat">Đã lưu: <strong id="savedCount">0</strong> quảng cáo có YouTube ID</div>
+    </div>
     <button id="cancelBtn" onclick="cancelScrape()">Huỷ</button>
   </div>
 
@@ -325,6 +349,8 @@
     document.getElementById('progressFill').style.width = '0%';
     document.getElementById('countText').textContent = '0 / 0';
     document.getElementById('statusMsg').textContent = 'Đang khởi động…';
+    document.getElementById('detectedCount').textContent = '0';
+    document.getElementById('savedCount').textContent = '0';
 
     try {
       const res = await fetch('/api/scrape', {
@@ -358,10 +384,15 @@
       }
       const job = await res.json();
 
-      const pct = job.total > 0 ? (job.progress / job.total) * 100 : 0;
+      const discovered = typeof job.discovered === 'number' ? job.discovered : (job.total || 0);
+      const totalForDisplay = job.total > 0 ? job.total : discovered;
+      const savedCount = typeof job.matched === 'number' ? job.matched : 0;
+      const pct = totalForDisplay > 0 ? (job.progress / totalForDisplay) * 100 : 0;
       document.getElementById('progressFill').style.width = pct + '%';
-      document.getElementById('countText').textContent = `${job.progress} / ${job.total}`;
+      document.getElementById('countText').textContent = `${job.progress} / ${totalForDisplay}`;
       document.getElementById('statusMsg').textContent = job.message || '…';
+      document.getElementById('detectedCount').textContent = discovered;
+      document.getElementById('savedCount').textContent = savedCount;
 
       if (job.status === 'done') {
         clearInterval(pollTimer);
