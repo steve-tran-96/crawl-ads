@@ -198,7 +198,7 @@ async def _run_job(job_id: str, url: str):
             job["progress"] = current
             job["total"] = total
             job["discovered"] = max(job.get("discovered", 0), total)
-            job["message"] = f"[{current}/{total}] Đang xử lý {cid}…"
+            job["message"] = f"[{current}/{total}] Đã xử lý {cid}…"
             _save_jobs()
 
         async def on_status(message: str):

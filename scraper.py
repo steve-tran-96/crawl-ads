@@ -6,6 +6,7 @@ import asyncio
 from dataclasses import dataclass
 import json
 import logging
+import os
 import re
 import sys
 import time
@@ -23,13 +24,30 @@ logging.basicConfig(
 )
 log = logging.getLogger("scraper")
 
+
+def env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
 SCROLL_PAUSE       = 0.35  # buffer sau networkidle
 MAX_EMPTY_SCROLLS  = 12
 MAX_STALL_SECONDS  = 12
 PER_SCROLL_TIMEOUT = 3
-PAGE_WAIT          = 8
 SCROLL_STEP        = 600   # nhỏ hơn để không bỏ qua trigger point lazy load
 BOTTOM_EPSILON     = 48
+DETAIL_CONCURRENCY = max(1, env_int("DETAIL_CONCURRENCY", 8))
+DETAIL_BACKOFF_CONCURRENCY = max(1, env_int("DETAIL_BACKOFF_CONCURRENCY", 4))
+DETAIL_BACKOFF_FAILURE_THRESHOLD = max(1, env_int("DETAIL_BACKOFF_FAILURE_THRESHOLD", 10))
+DETAIL_NAV_TIMEOUT_MS = max(1000, env_int("DETAIL_NAV_TIMEOUT_MS", 15_000))
+DETAIL_SIGNAL_TIMEOUT_MS = max(500, env_int("DETAIL_SIGNAL_TIMEOUT_MS", 2_500))
+DETAIL_SETTLE_MS = max(0, env_int("DETAIL_SETTLE_MS", 400))
+DETAIL_WORKER_IDLE_TIMEOUT_MS = max(250, env_int("DETAIL_WORKER_IDLE_TIMEOUT_MS", 500))
 
 BROWSER_ARGS = [
     "--no-sandbox",
@@ -527,77 +545,208 @@ async def scroll_and_collect_links(
     return sorted(seen)
 
 
-async def scrape_creative(browser, relative_href: str) -> dict:
-    result = {"creative_id": "", "product_name": "", "landing_page": "", "youtube_link": ""}
-
+def creative_id_from_href(relative_href: str) -> str:
     m = re.search(r"creative/(CR[A-Za-z0-9]+)", relative_href)
-    if m:
-        result["creative_id"] = m.group(1)
+    return m.group(1) if m else ""
 
-    detail_url = f"https://adstransparency.google.com{relative_href}"
 
-    ctx = await browser.new_context(
-        locale="vi-VN",
-        user_agent=USER_AGENT,
-        viewport={"width": 1440, "height": 900},
+def is_external_landing_page(url: str) -> bool:
+    return (
+        url.startswith("http")
+        and "google" not in url
+        and "ytimg" not in url
+        and "gstatic" not in url
+        and "googleapis" not in url
+        and "googlesyndication" not in url
+        and "ampproject" not in url
     )
-    page = await ctx.new_page()
 
+
+def inspect_creative_frames(page) -> tuple[list[str], object | None]:
     yt_ids: list[str] = []
     first_dv_frame = None
 
-    def on_frame(frame):
-        nonlocal first_dv_frame
-        url = frame.url
+    for frame in page.frames:
+        url = frame.url or ""
         if "youtube.com/embed/" in url:
-            vid = yt_id_from_embed_url(url)
-            if vid and vid not in yt_ids:
-                yt_ids.append(vid)
+            video_id = yt_id_from_embed_url(url)
+            if video_id and video_id not in yt_ids:
+                yt_ids.append(video_id)
         if "discover_video_ads" in url and first_dv_frame is None:
             first_dv_frame = frame
 
-    page.on("framenavigated", on_frame)
+    return yt_ids, first_dv_frame
+
+
+async def wait_for_creative_signals(page) -> tuple[list[str], object | None]:
+    deadline = time.monotonic() + (DETAIL_SIGNAL_TIMEOUT_MS / 1000)
+    settled_for = DETAIL_SETTLE_MS / 1000
+
+    while time.monotonic() < deadline:
+        yt_ids, first_dv_frame = inspect_creative_frames(page)
+        if yt_ids or first_dv_frame is not None:
+            if settled_for:
+                await asyncio.sleep(settled_for)
+            final_yt_ids, final_dv_frame = inspect_creative_frames(page)
+            if final_yt_ids:
+                yt_ids = final_yt_ids
+            if final_dv_frame is not None:
+                first_dv_frame = final_dv_frame
+            return yt_ids, first_dv_frame
+        await asyncio.sleep(0.1)
+
+    return inspect_creative_frames(page)
+
+
+async def extract_creative_fields(first_dv_frame) -> tuple[str, str]:
+    product_name = ""
+    landing_page = ""
+
+    if first_dv_frame is None:
+        return product_name, landing_page
 
     try:
-        await page.goto(detail_url, wait_until="domcontentloaded", timeout=30_000)
-        await asyncio.sleep(PAGE_WAIT)
+        body_text = await first_dv_frame.inner_text("body", timeout=DETAIL_SIGNAL_TIMEOUT_MS)
+        lines = [
+            line.strip() for line in body_text.splitlines()
+            if line.strip()
+            and line.strip() not in ("Sponsored", "Được tài trợ", "00:00")
+            and not re.fullmatch(r"\d+:\d+", line.strip())
+        ]
+        product_name = " ".join(lines).strip()
+    except Exception:
+        pass
 
+    try:
+        anchors = await first_dv_frame.query_selector_all("a[href]")
+        for anchor in anchors:
+            href = await anchor.get_attribute("href") or ""
+            if is_external_landing_page(href):
+                landing_page = href
+                break
+    except Exception:
+        pass
+
+    return product_name, landing_page
+
+
+async def scrape_creative(page, relative_href: str) -> dict:
+    result = {"creative_id": "", "product_name": "", "landing_page": "", "youtube_link": ""}
+    result["creative_id"] = creative_id_from_href(relative_href)
+
+    detail_url = f"https://adstransparency.google.com{relative_href}"
+
+    try:
+        await page.goto(detail_url, wait_until="domcontentloaded", timeout=DETAIL_NAV_TIMEOUT_MS)
+        yt_ids, first_dv_frame = await wait_for_creative_signals(page)
         if yt_ids:
             result["youtube_link"] = yt_link(yt_ids[0])
 
-        if first_dv_frame is not None:
-            try:
-                body_text = await first_dv_frame.inner_text("body")
-                lines = [
-                    ln.strip() for ln in body_text.splitlines()
-                    if ln.strip()
-                    and ln.strip() not in ("Sponsored", "Được tài trợ", "00:00")
-                    and not re.fullmatch(r"\d+:\d+", ln.strip())
-                ]
-                result["product_name"] = " ".join(lines).strip()
-
-                anchors = await first_dv_frame.query_selector_all("a[href]")
-                for a in anchors:
-                    href = await a.get_attribute("href") or ""
-                    if (
-                        href.startswith("http")
-                        and "google" not in href
-                        and "ytimg" not in href
-                        and "gstatic" not in href
-                        and "googleapis" not in href
-                        and "googlesyndication" not in href
-                        and "ampproject" not in href
-                    ):
-                        result["landing_page"] = href
-                        break
-            except Exception:
-                pass
+        product_name, landing_page = await extract_creative_fields(first_dv_frame)
+        result["product_name"] = product_name
+        result["landing_page"] = landing_page
     except Exception as e:
         result["error"] = str(e)
-    finally:
-        await ctx.close()
 
     return result
+
+
+async def scrape_creatives_parallel(
+    browser,
+    hrefs: list[str],
+    cancelled: Callable[[], bool],
+    on_progress: Callable[[int, int, str], Awaitable[None]] | None = None,
+    on_saved: Callable[[int], Awaitable[None]] | None = None,
+    on_status: Callable[[str], Awaitable[None]] | None = None,
+) -> list[dict]:
+    total = len(hrefs)
+    if total == 0:
+        return []
+
+    worker_count = min(DETAIL_CONCURRENCY, total)
+    fallback_count = min(worker_count, DETAIL_BACKOFF_CONCURRENCY)
+
+    if on_status:
+        await on_status(
+            f"Tìm thấy {total} quảng cáo. Đang scrape chi tiết song song ({worker_count} workers)..."
+        )
+
+    queue: asyncio.Queue[tuple[int, str]] = asyncio.Queue()
+    for index, href in enumerate(hrefs):
+        queue.put_nowait((index, href))
+
+    results: list[dict | None] = [None] * total
+    completed_count = 0
+    saved_count = 0
+    timeout_failures = 0
+    progress_lock = asyncio.Lock()
+    backoff_event = asyncio.Event()
+    backoff_notified = False
+
+    async def worker(worker_id: int) -> None:
+        nonlocal completed_count, saved_count, timeout_failures, backoff_notified
+
+        context = await browser.new_context(
+            locale="vi-VN",
+            user_agent=USER_AGENT,
+            viewport={"width": 1440, "height": 900},
+        )
+        page = await context.new_page()
+
+        try:
+            while not cancelled():
+                if backoff_event.is_set() and worker_id > fallback_count:
+                    break
+
+                try:
+                    item = await asyncio.wait_for(
+                        queue.get(),
+                        timeout=DETAIL_WORKER_IDLE_TIMEOUT_MS / 1000,
+                    )
+                except asyncio.TimeoutError:
+                    if queue.empty():
+                        break
+                    continue
+
+                index, href = item
+                creative_id = creative_id_from_href(href) or "?"
+                log.info("[W%s] [%s/%s] Scraping %s...", worker_id, index + 1, total, creative_id)
+
+                data = await scrape_creative(page, href)
+                queue.task_done()
+
+                async with progress_lock:
+                    if data.get("youtube_link"):
+                        results[index] = data
+                        saved_count += 1
+                        if on_saved:
+                            await on_saved(saved_count)
+
+                    completed_count += 1
+                    if on_progress:
+                        await on_progress(completed_count, total, creative_id)
+
+                    error_text = str(data.get("error") or "")
+                    if error_text and "timeout" in error_text.lower():
+                        timeout_failures += 1
+                        if (
+                            worker_count > fallback_count
+                            and not backoff_notified
+                            and timeout_failures >= DETAIL_BACKOFF_FAILURE_THRESHOLD
+                        ):
+                            backoff_notified = True
+                            backoff_event.set()
+                            if on_status:
+                                await on_status(
+                                    f"Timeout tăng cao, giảm xuống {fallback_count} workers..."
+                                )
+        finally:
+            await context.close()
+
+    workers = [asyncio.create_task(worker(worker_id)) for worker_id in range(1, worker_count + 1)]
+    await asyncio.gather(*workers, return_exceptions=False)
+
+    return [row for row in results if row and row.get("youtube_link")]
 
 
 async def run_scrape(
@@ -689,29 +838,16 @@ async def run_scrape(
         await status(f"Tìm thấy {total} quảng cáo. Bắt đầu lọc các quảng cáo có YouTube ID...")
 
         # Bước 2: Scrape từng creative
-        rows = []
         if on_saved:
             await on_saved(0)
-        for i, href in enumerate(hrefs, 1):
-            if cancelled():
-                log.info(f"Huỷ tại creative {i}/{total}.")
-                break
-
-            cid = re.search(r"creative/(CR[A-Za-z0-9]+)", href)
-            cid_str = cid.group(1) if cid else "?"
-
-            if on_progress:
-                await on_progress(i - 1, total, cid_str)
-
-            log.info(f"[{i}/{total}] Scraping {cid_str}...")
-            data = await scrape_creative(browser, href)
-            if data.get("youtube_link"):
-                rows.append(data)
-                if on_saved:
-                    await on_saved(len(rows))
-
-            if on_progress:
-                await on_progress(i, total, cid_str)
+        rows = await scrape_creatives_parallel(
+            browser,
+            hrefs,
+            cancelled,
+            on_progress=on_progress,
+            on_saved=on_saved,
+            on_status=status,
+        )
 
         await browser.close()
         await status(f"Đã lọc được {len(rows)} quảng cáo có YouTube ID.")
