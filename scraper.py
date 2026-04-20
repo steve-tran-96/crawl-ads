@@ -582,20 +582,52 @@ async def wait_for_creative_signals(page) -> tuple[list[str], object | None]:
     deadline = time.monotonic() + (DETAIL_SIGNAL_TIMEOUT_MS / 1000)
     settled_for = DETAIL_SETTLE_MS / 1000
 
-    while time.monotonic() < deadline:
-        yt_ids, first_dv_frame = inspect_creative_frames(page)
-        if yt_ids or first_dv_frame is not None:
-            if settled_for:
-                await asyncio.sleep(settled_for)
-            final_yt_ids, final_dv_frame = inspect_creative_frames(page)
-            if final_yt_ids:
-                yt_ids = final_yt_ids
-            if final_dv_frame is not None:
-                first_dv_frame = final_dv_frame
-            return yt_ids, first_dv_frame
-        await asyncio.sleep(0.1)
+    yt_ids: list[str] = []
+    first_dv_frame = None
 
-    return inspect_creative_frames(page)
+    def capture_frame(frame) -> None:
+        nonlocal first_dv_frame
+        url = frame.url or ""
+        if "youtube.com/embed/" in url:
+            video_id = yt_id_from_embed_url(url)
+            if video_id and video_id not in yt_ids:
+                yt_ids.append(video_id)
+        if "discover_video_ads" in url and first_dv_frame is None:
+            first_dv_frame = frame
+
+    page.on("framenavigated", capture_frame)
+    try:
+        initial_yt_ids, initial_dv_frame = inspect_creative_frames(page)
+        yt_ids.extend(initial_yt_ids)
+        if initial_dv_frame is not None:
+            first_dv_frame = initial_dv_frame
+
+        while time.monotonic() < deadline:
+            polled_yt_ids, polled_dv_frame = inspect_creative_frames(page)
+            for video_id in polled_yt_ids:
+                if video_id not in yt_ids:
+                    yt_ids.append(video_id)
+            if polled_dv_frame is not None and first_dv_frame is None:
+                first_dv_frame = polled_dv_frame
+
+            if yt_ids:
+                break
+
+            await asyncio.sleep(0.1)
+
+        if settled_for:
+            await asyncio.sleep(settled_for)
+
+        final_yt_ids, final_dv_frame = inspect_creative_frames(page)
+        for video_id in final_yt_ids:
+            if video_id not in yt_ids:
+                yt_ids.append(video_id)
+        if final_dv_frame is not None and first_dv_frame is None:
+            first_dv_frame = final_dv_frame
+
+        return yt_ids, first_dv_frame
+    finally:
+        page.remove_listener("framenavigated", capture_frame)
 
 
 async def extract_creative_fields(first_dv_frame) -> tuple[str, str]:
