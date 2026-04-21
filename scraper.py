@@ -63,11 +63,23 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
-EXPORT_COLUMNS = ["creative_id", "product_name", "landing_page", "youtube_link", "video_link"]
+EXPORT_COLUMNS = [
+    "creative_id",
+    "is_video",
+    "product_name",
+    "landing_page",
+    "creative_detail_url",
+    "preview_script_url",
+    "youtube_link",
+    "video_link",
+]
 EXPORT_COLUMN_LABELS = {
     "creative_id": "Creative ID",
+    "is_video": "Là Video",
     "product_name": "Tên sản phẩm",
     "landing_page": "Landing Page",
+    "creative_detail_url": "Link Chi Tiết",
+    "preview_script_url": "Link Preview Script",
     "youtube_link": "Link YouTube",
     "video_link": "Link Video",
 }
@@ -82,6 +94,21 @@ class ScrapeResult:
     exported_total: int
     youtube_total: int
     non_youtube_total: int
+
+
+@dataclass(frozen=True)
+class CreativeSeed:
+    href: str
+    is_video: bool = False
+    preview_script_url: str = ""
+
+    @property
+    def creative_id(self) -> str:
+        return creative_id_from_href(self.href)
+
+    @property
+    def detail_url(self) -> str:
+        return f"https://adstransparency.google.com{self.href}"
 
 
 def yt_id_from_embed_url(url: str) -> str | None:
@@ -100,6 +127,47 @@ def normalize_candidate_url(url: str | None) -> str:
     if not value or value == "about:blank":
         return ""
     return value
+
+
+def normalize_creative_href(href: str | None) -> str:
+    value = normalize_candidate_url(href)
+    if not value:
+        return ""
+
+    if value.startswith("http://") or value.startswith("https://"):
+        parsed = urlsplit(value)
+        value = parsed.path or ""
+        if parsed.query:
+            value = f"{value}?{parsed.query}"
+
+    if "/creative/" not in value:
+        return ""
+    return value
+
+
+def make_creative_seed(
+    href: str | None,
+    *,
+    is_video: bool = False,
+    preview_script_url: str | None = None,
+) -> CreativeSeed | None:
+    normalized_href = normalize_creative_href(href)
+    if not normalized_href:
+        return None
+
+    return CreativeSeed(
+        href=normalized_href,
+        is_video=is_video,
+        preview_script_url=normalize_candidate_url(preview_script_url),
+    )
+
+
+def merge_creative_seed(current: CreativeSeed, update: CreativeSeed) -> CreativeSeed:
+    return CreativeSeed(
+        href=current.href,
+        is_video=current.is_video or update.is_video,
+        preview_script_url=current.preview_script_url or update.preview_script_url,
+    )
 
 
 def is_youtube_url(url: str) -> bool:
@@ -309,8 +377,8 @@ async def scroll_and_collect_links(
     cancelled=None,
     initial_hrefs: list[str] | None = None,
     on_discovered: Callable[[int], Awaitable[None]] | None = None,
-) -> list[str]:
-    seen: set[str] = set()
+) -> list[CreativeSeed]:
+    seen: dict[str, CreativeSeed] = {}
     no_change = 0
     last_growth_at = time.monotonic()
     bottom_hits = 0
@@ -319,27 +387,64 @@ async def scroll_and_collect_links(
     response_lock = asyncio.Lock()
     rpc_event = asyncio.Event()
 
-    async def add_hrefs(hrefs: list[str], source: str) -> int:
+    async def add_seeds(seeds: list[CreativeSeed], source: str) -> int:
         nonlocal last_growth_at
-        new = [href for href in hrefs if href not in seen]
-        if not new:
+        new_count = 0
+
+        for seed in seeds:
+            existing = seen.get(seed.href)
+            if existing is None:
+                seen[seed.href] = seed
+                new_count += 1
+                continue
+
+            merged = merge_creative_seed(existing, seed)
+            if merged != existing:
+                seen[seed.href] = merged
+
+        if not new_count:
             return 0
-        seen.update(new)
+
         last_growth_at = time.monotonic()
         rpc_event.set()
         if on_discovered:
             await on_discovered(len(seen))
-        log.info("%s: tổng %s quảng cáo (+%s mới)", source, len(seen), len(new))
-        return len(new)
+        log.info("%s: tổng %s quảng cáo (+%s mới)", source, len(seen), new_count)
+        return new_count
 
-    async def collect_visible_hrefs() -> set[str]:
-        cards = await page.query_selector_all("creative-preview a[href]")
-        hrefs = set()
-        for c in cards:
-            href = await c.get_attribute("href")
-            if href and "/creative/" in href:
-                hrefs.add(href)
-        return hrefs
+    async def collect_visible_seeds() -> list[CreativeSeed]:
+        cards = await page.evaluate(
+            """
+            () => {
+              return Array.from(document.querySelectorAll('creative-preview')).map((card) => {
+                const anchor = card.querySelector('a[href*="/creative/"]');
+                if (!anchor) {
+                  return null;
+                }
+
+                const previewScript =
+                  card.querySelector('script[src*="displayads-formats.googleusercontent.com/ads/preview/content.js"]');
+
+                return {
+                  href: anchor.getAttribute('href') || anchor.href || '',
+                  is_video: !!card.querySelector('.video-indicator'),
+                  preview_script_url: previewScript ? (previewScript.getAttribute('src') || previewScript.src || '') : '',
+                };
+              }).filter(Boolean);
+            }
+            """
+        )
+
+        seeds: list[CreativeSeed] = []
+        for card in cards:
+            seed = make_creative_seed(
+                card.get("href"),
+                is_video=bool(card.get("is_video")),
+                preview_script_url=card.get("preview_script_url"),
+            )
+            if seed is not None:
+                seeds.append(seed)
+        return seeds
 
     async def get_scroll_metrics() -> dict:
         return await page.evaluate(
@@ -494,9 +599,10 @@ async def scroll_and_collect_links(
         try:
             payload = decode_search_creatives_response(await response.text())
             hrefs = extract_creative_hrefs_from_rpc(payload, advertiser_url)
+            seeds = [seed for href in hrefs if (seed := make_creative_seed(href))]
             async with response_lock:
                 rpc_count += 1
-                await add_hrefs(hrefs, f"RPC SearchCreatives #{rpc_count}")
+                await add_seeds(seeds, f"RPC SearchCreatives #{rpc_count}")
         except Exception as exc:
             log.warning("Không parse được SearchCreatives response: %s", exc)
 
@@ -512,11 +618,12 @@ async def scroll_and_collect_links(
     page.context.on("response", on_response)
 
     if initial_hrefs:
-        await add_hrefs(sorted(initial_hrefs), "RPC batch ban đầu")
+        initial_seeds = [seed for href in sorted(initial_hrefs) if (seed := make_creative_seed(href))]
+        await add_seeds(initial_seeds, "RPC batch ban đầu")
 
-    visible_hrefs = await collect_visible_hrefs()
-    if visible_hrefs:
-        await add_hrefs(sorted(visible_hrefs), "DOM batch ban đầu")
+    visible_seeds = await collect_visible_seeds()
+    if visible_seeds:
+        await add_seeds(visible_seeds, "DOM batch ban đầu")
 
     try:
         while no_change < MAX_EMPTY_SCROLLS:
@@ -552,9 +659,9 @@ async def scroll_and_collect_links(
                     await asyncio.sleep(0.5)
                     continue
 
-                hrefs = sorted(await collect_visible_hrefs())
+                seeds = await collect_visible_seeds()
                 async with response_lock:
-                    added_from_dom = await add_hrefs(hrefs, "DOM")
+                    added_from_dom = await add_seeds(seeds, "DOM")
                 if added_from_dom:
                     no_change = 0
                     found_new_this_round = True
@@ -603,7 +710,7 @@ async def scroll_and_collect_links(
         page.context.remove_listener("response", on_response)
 
     log.info(f"Kết thúc scroll. Tổng: {len(seen)} quảng cáo.")
-    return sorted(seen)
+    return sorted(seen.values(), key=lambda seed: seed.href)
 
 
 def creative_id_from_href(relative_href: str) -> str:
@@ -623,9 +730,9 @@ def is_external_landing_page(url: str) -> bool:
     )
 
 
-def inspect_creative_frames(page) -> tuple[list[str], object | None]:
+def inspect_creative_frames(page) -> tuple[list[str], list[object]]:
     yt_ids: list[str] = []
-    first_dv_frame = None
+    dv_frames: list[object] = []
 
     for frame in page.frames:
         url = frame.url or ""
@@ -633,43 +740,44 @@ def inspect_creative_frames(page) -> tuple[list[str], object | None]:
             video_id = yt_id_from_embed_url(url)
             if video_id and video_id not in yt_ids:
                 yt_ids.append(video_id)
-        if "discover_video_ads" in url and first_dv_frame is None:
-            first_dv_frame = frame
+        if "discover_video_ads" in url and frame not in dv_frames:
+            dv_frames.append(frame)
 
-    return yt_ids, first_dv_frame
+    return yt_ids, dv_frames
 
 
-async def wait_for_creative_signals(page) -> tuple[list[str], object | None]:
+async def wait_for_creative_signals(page) -> tuple[list[str], list[object]]:
     deadline = time.monotonic() + (DETAIL_SIGNAL_TIMEOUT_MS / 1000)
     settled_for = DETAIL_SETTLE_MS / 1000
 
     yt_ids: list[str] = []
-    first_dv_frame = None
+    dv_frames: list[object] = []
 
     def capture_frame(frame) -> None:
-        nonlocal first_dv_frame
         url = frame.url or ""
         if "youtube.com/embed/" in url:
             video_id = yt_id_from_embed_url(url)
             if video_id and video_id not in yt_ids:
                 yt_ids.append(video_id)
-        if "discover_video_ads" in url and first_dv_frame is None:
-            first_dv_frame = frame
+        if "discover_video_ads" in url and frame not in dv_frames:
+            dv_frames.append(frame)
 
     page.on("framenavigated", capture_frame)
     try:
-        initial_yt_ids, initial_dv_frame = inspect_creative_frames(page)
+        initial_yt_ids, initial_dv_frames = inspect_creative_frames(page)
         yt_ids.extend(initial_yt_ids)
-        if initial_dv_frame is not None:
-            first_dv_frame = initial_dv_frame
+        for frame in initial_dv_frames:
+            if frame not in dv_frames:
+                dv_frames.append(frame)
 
         while time.monotonic() < deadline:
-            polled_yt_ids, polled_dv_frame = inspect_creative_frames(page)
+            polled_yt_ids, polled_dv_frames = inspect_creative_frames(page)
             for video_id in polled_yt_ids:
                 if video_id not in yt_ids:
                     yt_ids.append(video_id)
-            if polled_dv_frame is not None and first_dv_frame is None:
-                first_dv_frame = polled_dv_frame
+            for frame in polled_dv_frames:
+                if frame not in dv_frames:
+                    dv_frames.append(frame)
 
             if yt_ids:
                 break
@@ -679,46 +787,55 @@ async def wait_for_creative_signals(page) -> tuple[list[str], object | None]:
         if settled_for:
             await asyncio.sleep(settled_for)
 
-        final_yt_ids, final_dv_frame = inspect_creative_frames(page)
+        final_yt_ids, final_dv_frames = inspect_creative_frames(page)
         for video_id in final_yt_ids:
             if video_id not in yt_ids:
                 yt_ids.append(video_id)
-        if final_dv_frame is not None and first_dv_frame is None:
-            first_dv_frame = final_dv_frame
+        for frame in final_dv_frames:
+            if frame not in dv_frames:
+                dv_frames.append(frame)
 
-        return yt_ids, first_dv_frame
+        return yt_ids, dv_frames
     finally:
         page.remove_listener("framenavigated", capture_frame)
 
 
-async def extract_creative_fields(first_dv_frame) -> tuple[str, str]:
+async def extract_creative_fields(dv_frames: list[object]) -> tuple[str, str]:
     product_name = ""
     landing_page = ""
 
-    if first_dv_frame is None:
+    if not dv_frames:
         return product_name, landing_page
 
-    try:
-        body_text = await first_dv_frame.inner_text("body", timeout=DETAIL_SIGNAL_TIMEOUT_MS)
-        lines = [
-            line.strip() for line in body_text.splitlines()
-            if line.strip()
-            and line.strip() not in ("Sponsored", "Được tài trợ", "00:00")
-            and not re.fullmatch(r"\d+:\d+", line.strip())
-        ]
-        product_name = " ".join(lines).strip()
-    except Exception:
-        pass
+    for frame in dv_frames:
+        if not product_name:
+            try:
+                body_text = await frame.inner_text("body", timeout=DETAIL_SIGNAL_TIMEOUT_MS)
+                lines = [
+                    line.strip() for line in body_text.splitlines()
+                    if line.strip()
+                    and line.strip() not in ("Sponsored", "Được tài trợ", "00:00")
+                    and not re.fullmatch(r"\d+:\d+", line.strip())
+                ]
+                candidate = " ".join(lines).strip()
+                if candidate:
+                    product_name = candidate
+            except Exception:
+                pass
 
-    try:
-        anchors = await first_dv_frame.query_selector_all("a[href]")
-        for anchor in anchors:
-            href = await anchor.get_attribute("href") or ""
-            if is_external_landing_page(href):
-                landing_page = href
-                break
-    except Exception:
-        pass
+        if not landing_page:
+            try:
+                anchors = await frame.query_selector_all("a[href]")
+                for anchor in anchors:
+                    href = await anchor.get_attribute("href") or ""
+                    if is_external_landing_page(href):
+                        landing_page = href
+                        break
+            except Exception:
+                pass
+
+        if product_name and landing_page:
+            break
 
     return product_name, landing_page
 
@@ -764,17 +881,20 @@ async def extract_video_candidates_from_frame(frame) -> list[str]:
     return [url for url in candidates if looks_like_video_url(url)]
 
 
-async def scrape_creative(page, relative_href: str) -> dict:
+async def scrape_creative(page, seed: CreativeSeed) -> dict:
     result = {
         "creative_id": "",
+        "is_video": seed.is_video,
         "product_name": "",
         "landing_page": "",
+        "creative_detail_url": seed.detail_url,
+        "preview_script_url": seed.preview_script_url,
         "youtube_link": "",
         "video_link": "",
     }
-    result["creative_id"] = creative_id_from_href(relative_href)
+    result["creative_id"] = seed.creative_id
 
-    detail_url = f"https://adstransparency.google.com{relative_href}"
+    detail_url = seed.detail_url
     request_video_candidates: list[str] = []
 
     def capture_request(request) -> None:
@@ -786,21 +906,31 @@ async def scrape_creative(page, relative_href: str) -> dict:
     try:
         page.on("request", capture_request)
         await page.goto(detail_url, wait_until="domcontentloaded", timeout=DETAIL_NAV_TIMEOUT_MS)
-        yt_ids, first_dv_frame = await wait_for_creative_signals(page)
+        yt_ids, dv_frames = await wait_for_creative_signals(page)
+        if dv_frames:
+            result["is_video"] = True
         if yt_ids:
+            result["is_video"] = True
             result["youtube_link"] = yt_link(yt_ids[0])
             result["video_link"] = result["youtube_link"]
 
-        product_name, landing_page = await extract_creative_fields(first_dv_frame)
+        product_name, landing_page = await extract_creative_fields(dv_frames)
         result["product_name"] = product_name
         result["landing_page"] = landing_page
 
         if not result["video_link"]:
-            dom_video_candidates = await extract_video_candidates_from_frame(first_dv_frame)
+            dom_video_candidates: list[str] = []
+            for frame in dv_frames:
+                frame_candidates = await extract_video_candidates_from_frame(frame)
+                for candidate in frame_candidates:
+                    if candidate not in dom_video_candidates:
+                        dom_video_candidates.append(candidate)
             frame_video_candidates = collect_frame_video_candidates(page)
             result["video_link"] = pick_non_youtube_video_link(
                 request_video_candidates + dom_video_candidates + frame_video_candidates
             )
+            if result["video_link"]:
+                result["is_video"] = True
     except Exception as e:
         result["error"] = str(e)
     finally:
@@ -811,13 +941,13 @@ async def scrape_creative(page, relative_href: str) -> dict:
 
 async def scrape_creatives_parallel(
     browser,
-    hrefs: list[str],
+    seeds: list[CreativeSeed],
     cancelled: Callable[[], bool],
     on_progress: Callable[[int, int, str], Awaitable[None]] | None = None,
     on_saved: Callable[[int], Awaitable[None]] | None = None,
     on_status: Callable[[str], Awaitable[None]] | None = None,
 ) -> list[dict]:
-    total = len(hrefs)
+    total = len(seeds)
     if total == 0:
         return []
 
@@ -829,9 +959,9 @@ async def scrape_creatives_parallel(
             f"Tìm thấy {total} quảng cáo. Đang scrape chi tiết song song ({worker_count} workers)..."
         )
 
-    queue: asyncio.Queue[tuple[int, str]] = asyncio.Queue()
-    for index, href in enumerate(hrefs):
-        queue.put_nowait((index, href))
+    queue: asyncio.Queue[tuple[int, CreativeSeed]] = asyncio.Queue()
+    for index, seed in enumerate(seeds):
+        queue.put_nowait((index, seed))
 
     results: list[dict | None] = [None] * total
     completed_count = 0
@@ -866,11 +996,11 @@ async def scrape_creatives_parallel(
                         break
                     continue
 
-                index, href = item
-                creative_id = creative_id_from_href(href) or "?"
+                index, seed = item
+                creative_id = seed.creative_id or "?"
                 log.info("[W%s] [%s/%s] Scraping %s...", worker_id, index + 1, total, creative_id)
 
-                data = await scrape_creative(page, href)
+                data = await scrape_creative(page, seed)
                 queue.task_done()
 
                 async with progress_lock:
@@ -908,7 +1038,13 @@ async def scrape_creatives_parallel(
 
 
 def export_rows_to_excel(rows: list[dict], output_file: Path) -> None:
-    df = pd.DataFrame(rows, columns=EXPORT_COLUMNS)
+    export_rows = []
+    for row in rows:
+        export_row = dict(row)
+        export_row["is_video"] = "Có" if row.get("is_video") else "Không"
+        export_rows.append(export_row)
+
+    df = pd.DataFrame(export_rows, columns=EXPORT_COLUMNS)
     df.index = df.index + 1
     df.rename(columns=EXPORT_COLUMN_LABELS, inplace=True)
 
@@ -916,7 +1052,17 @@ def export_rows_to_excel(rows: list[dict], output_file: Path) -> None:
     with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
         df.to_excel(writer, sheet_name="Ads", index=True, index_label="STT")
         ws = writer.sheets["Ads"]
-        for col_letter, width in {"A": 6, "B": 22, "C": 55, "D": 55, "E": 45, "F": 45}.items():
+        for col_letter, width in {
+            "A": 6,
+            "B": 22,
+            "C": 12,
+            "D": 55,
+            "E": 45,
+            "F": 55,
+            "G": 60,
+            "H": 45,
+            "I": 45,
+        }.items():
             ws.column_dimensions[col_letter].width = width
         for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
             for cell in row:
@@ -999,7 +1145,7 @@ async def run_scrape(
         else:
             await status("Không bắt được SearchCreatives ban đầu, tiếp tục bằng cuộn trang...")
 
-        hrefs = await scroll_and_collect_links(
+        seeds = await scroll_and_collect_links(
             page0,
             advertiser_url,
             cancelled,
@@ -1008,7 +1154,7 @@ async def run_scrape(
         )
         await ctx0.close()
 
-        total = len(hrefs)
+        total = len(seeds)
         if on_discovered:
             await on_discovered(total)
         await status(f"Tìm thấy {total} quảng cáo. Bắt đầu lọc các quảng cáo có YouTube ID...")
@@ -1018,7 +1164,7 @@ async def run_scrape(
             await on_saved(0)
         rows = await scrape_creatives_parallel(
             browser,
-            hrefs,
+            seeds,
             cancelled,
             on_progress=on_progress,
             on_saved=on_saved,
