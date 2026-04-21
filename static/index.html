@@ -9,12 +9,24 @@
 
     body {
       min-height: 100vh;
-      display: flex;
-      align-items: center;
-      justify-content: center;
       background: #f0f2f5;
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       padding: 24px;
+    }
+
+    .app-shell {
+      width: 100%;
+      max-width: 1040px;
+      margin: 0 auto;
+      display: grid;
+      grid-template-columns: minmax(0, 640px);
+      gap: 24px;
+      justify-content: center;
+      align-items: start;
+    }
+
+    .app-shell.has-results {
+      grid-template-columns: minmax(0, 640px) minmax(280px, 360px);
     }
 
     .card {
@@ -23,7 +35,6 @@
       box-shadow: 0 4px 24px rgba(0,0,0,.08);
       padding: 40px 44px;
       width: 100%;
-      max-width: 640px;
       position: relative;
     }
 
@@ -187,7 +198,6 @@
     .done-row {
       display: flex;
       align-items: center;
-      justify-content: space-between;
       gap: 12px;
     }
     .done-info { display: flex; align-items: center; gap: 10px; }
@@ -195,13 +205,115 @@
     .done-text h3 { font-size: 15px; font-weight: 700; color: #166534; }
     .done-text p { font-size: 13px; color: #4ade80; margin-top: 2px; }
 
-    #downloadBtn {
-      background: #16a34a;
+    .results-panel {
+      display: none;
+    }
+
+    .results-card {
+      background: #fff;
+      border-radius: 16px;
+      box-shadow: 0 4px 24px rgba(0,0,0,.08);
+      padding: 28px 24px;
+      border: 1px solid #e5e7eb;
+    }
+
+    .results-kicker {
+      display: inline-flex;
+      align-items: center;
+      padding: 5px 10px;
+      border-radius: 999px;
+      background: #eef2ff;
+      color: #4338ca;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+      margin-bottom: 12px;
+    }
+
+    .results-card h2 {
+      font-size: 20px;
+      font-weight: 700;
+      color: #111827;
+      margin-bottom: 8px;
+    }
+
+    .results-summary {
+      font-size: 13px;
+      color: #6b7280;
+      line-height: 1.6;
+      margin-bottom: 18px;
+    }
+
+    .result-list {
+      display: grid;
+      gap: 14px;
+    }
+
+    .result-item {
+      border: 1px solid #e5e7eb;
+      border-radius: 14px;
+      padding: 16px;
+      background: #f8fafc;
+    }
+
+    .result-item-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 10px;
+    }
+
+    .result-title {
+      font-size: 14px;
+      font-weight: 700;
+      color: #111827;
+    }
+
+    .result-caption {
+      font-size: 12px;
+      color: #6b7280;
+      line-height: 1.5;
+    }
+
+    .result-count {
+      flex-shrink: 0;
+      min-width: 54px;
+      text-align: center;
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: #e2e8f0;
+      color: #111827;
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .result-actions {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-top: 12px;
+    }
+
+    .result-file {
+      font-size: 11px;
+      color: #6b7280;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+
+    .result-download {
+      background: #111827;
       color: #fff;
-      padding: 0 18px;
+      padding: 0 16px;
+      height: 40px;
       font-size: 13px;
     }
-    #downloadBtn:hover { background: #15803d; }
+
+    .result-download:hover:not(:disabled) {
+      background: #0f172a;
+    }
 
     /* Error state */
     #errorSection {
@@ -244,10 +356,39 @@
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
       letter-spacing: .02em;
     }
+
+    @media (max-width: 980px) {
+      .app-shell.has-results {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media (max-width: 640px) {
+      body {
+        padding: 16px;
+      }
+
+      .card,
+      .results-card {
+        padding: 24px 20px;
+      }
+
+      .done-row,
+      .result-item-head,
+      .result-actions {
+        flex-direction: column;
+        align-items: flex-start;
+      }
+
+      .result-count {
+        min-width: 0;
+      }
+    }
   </style>
 </head>
 <body>
 
+<div class="app-shell" id="appShell">
 <div class="card">
 
   <!-- Logo -->
@@ -302,7 +443,6 @@
           <p id="doneMsg"></p>
         </div>
       </div>
-      <button id="downloadBtn" onclick="downloadFile()">⬇ Tải Excel</button>
     </div>
   </div>
 
@@ -319,9 +459,51 @@
   <div class="version-badge" id="versionBadge">v…</div>
 
 </div>
+<aside class="results-panel" id="resultsPanel">
+  <div class="results-card">
+    <span class="results-kicker">Result</span>
+    <h2>Kết quả phân loại</h2>
+    <p class="results-summary" id="resultsSummary">
+      Sau khi job hoàn tất, hai file riêng cho nhóm YouTube và không phải YouTube sẽ hiện ở đây.
+    </p>
+
+    <div class="result-list">
+      <div class="result-item">
+        <div class="result-item-head">
+          <div>
+            <div class="result-title">Có YouTube</div>
+            <div class="result-caption">Các quảng cáo tìm được `youtube_link`.</div>
+          </div>
+          <div class="result-count" id="youtubeResultCount">0</div>
+        </div>
+        <div class="result-actions">
+          <span class="result-file" id="youtubeResultFile">ads_youtube.xlsx</span>
+          <button class="result-download" id="downloadYoutubeBtn" onclick="downloadResult('youtube')">⬇ Tải file</button>
+        </div>
+      </div>
+
+      <div class="result-item">
+        <div class="result-item-head">
+          <div>
+            <div class="result-title">Không phải YouTube</div>
+            <div class="result-caption">Các quảng cáo không có `youtube_link`, để bạn đối chiếu lại.</div>
+          </div>
+          <div class="result-count" id="nonYoutubeResultCount">0</div>
+        </div>
+        <div class="result-actions">
+          <span class="result-file" id="nonYoutubeResultFile">ads_non_youtube.xlsx</span>
+          <button class="result-download" id="downloadNonYoutubeBtn" onclick="downloadResult('non_youtube')">⬇ Tải file</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</aside>
+</div>
 
 <script>
   let jobId = null;
+  let completedJobId = null;
+  let completedResults = null;
   let pollTimer = null;
   let jobsSummaryTimer = null;
   let pollErrorCount = 0;
@@ -329,6 +511,7 @@
   // Khi load trang, kiểm tra xem có job cũ đang chạy không
   window.addEventListener('DOMContentLoaded', () => {
     loadVersion();
+    resetResultsPanel();
     refreshJobsSummary();
     jobsSummaryTimer = setInterval(refreshJobsSummary, 2000);
     const savedJobId = localStorage.getItem('jobId');
@@ -366,6 +549,60 @@
     }
   }
 
+  function setResultsVisible(visible) {
+    document.getElementById('resultsPanel').style.display = visible ? 'block' : 'none';
+    document.getElementById('appShell').classList.toggle('has-results', visible);
+  }
+
+  function resetResultsPanel() {
+    completedJobId = null;
+    completedResults = null;
+    document.getElementById('resultsSummary').textContent =
+      'Sau khi job hoàn tất, hai file riêng cho nhóm YouTube và không phải YouTube sẽ hiện ở đây.';
+    document.getElementById('youtubeResultCount').textContent = '0';
+    document.getElementById('nonYoutubeResultCount').textContent = '0';
+    document.getElementById('youtubeResultFile').textContent = 'ads_youtube.xlsx';
+    document.getElementById('nonYoutubeResultFile').textContent = 'ads_non_youtube.xlsx';
+    document.getElementById('downloadYoutubeBtn').disabled = true;
+    document.getElementById('downloadNonYoutubeBtn').disabled = true;
+    setResultsVisible(false);
+  }
+
+  function renderResults(job, finishedJobId) {
+    const total = typeof job.total === 'number' ? job.total : 0;
+    const results = job.results || {};
+    const youtube = results.youtube || {};
+    const nonYoutube = results.non_youtube || {};
+    const youtubeCount = typeof youtube.count === 'number'
+      ? youtube.count
+      : (typeof job.youtube_total === 'number' ? job.youtube_total : (typeof job.matched === 'number' ? job.matched : 0));
+    const nonYoutubeCount = typeof nonYoutube.count === 'number'
+      ? nonYoutube.count
+      : (typeof job.non_youtube_total === 'number' ? job.non_youtube_total : Math.max(total - youtubeCount, 0));
+
+    completedJobId = finishedJobId;
+    completedResults = {
+      youtube: {
+        count: youtubeCount,
+        download_url: youtube.download_url || `/api/download/${finishedJobId}/youtube`,
+      },
+      non_youtube: {
+        count: nonYoutubeCount,
+        download_url: nonYoutube.download_url || `/api/download/${finishedJobId}/non_youtube`,
+      },
+    };
+
+    document.getElementById('resultsSummary').textContent =
+      `Đã quét ${total} quảng cáo. ${youtubeCount} quảng cáo có YouTube và ${nonYoutubeCount} quảng cáo không phải YouTube.`;
+    document.getElementById('youtubeResultCount').textContent = String(youtubeCount);
+    document.getElementById('nonYoutubeResultCount').textContent = String(nonYoutubeCount);
+    document.getElementById('youtubeResultFile').textContent = 'ads_youtube.xlsx';
+    document.getElementById('nonYoutubeResultFile').textContent = 'ads_non_youtube.xlsx';
+    document.getElementById('downloadYoutubeBtn').disabled = !completedResults.youtube.download_url;
+    document.getElementById('downloadNonYoutubeBtn').disabled = !completedResults.non_youtube.download_url;
+    setResultsVisible(true);
+  }
+
   async function startScrape() {
     const url = document.getElementById('urlInput').value.trim();
     if (!url) {
@@ -378,6 +615,7 @@
       pollTimer = null;
     }
     pollErrorCount = 0;
+    resetResultsPanel();
 
     // Reset UI
     setSection('progress');
@@ -436,15 +674,22 @@
       document.getElementById('savedCount').textContent = savedCount;
 
       if (job.status === 'done') {
+        const finishedJobId = jobId;
         clearInterval(pollTimer);
         pollTimer = null;
         localStorage.removeItem('jobId');
-        jobId = null;
         refreshJobsSummary();
         setSection('done');
-        const matchedCount = typeof job.matched === 'number' ? job.matched : job.total;
+        const matchedCount = typeof job.youtube_total === 'number'
+          ? job.youtube_total
+          : (typeof job.matched === 'number' ? job.matched : job.total);
+        const nonYoutubeCount = typeof job.non_youtube_total === 'number'
+          ? job.non_youtube_total
+          : Math.max((job.total || 0) - matchedCount, 0);
         document.getElementById('doneMsg').textContent =
-          `Đã xuất ${matchedCount} quảng cáo có YouTube ID.`;
+          `Có ${matchedCount} quảng cáo YouTube và ${nonYoutubeCount} quảng cáo không phải YouTube.`;
+        renderResults(job, finishedJobId);
+        jobId = null;
         document.getElementById('scrapeBtn').disabled = false;
       } else if (job.status === 'cancelled') {
         clearInterval(pollTimer);
@@ -453,6 +698,7 @@
         jobId = null;
         refreshJobsSummary();
         setSection('none');
+        resetResultsPanel();
         document.getElementById('scrapeBtn').disabled = false;
       } else if (job.status === 'error') {
         clearInterval(pollTimer);
@@ -460,6 +706,7 @@
         localStorage.removeItem('jobId');
         jobId = null;
         refreshJobsSummary();
+        resetResultsPanel();
         showError(job.error || 'Lỗi không xác định.');
       }
     } catch (e) {
@@ -470,13 +717,22 @@
         localStorage.removeItem('jobId');
         jobId = null;
         refreshJobsSummary();
+        resetResultsPanel();
         showError('Không thể đồng bộ trạng thái job cũ. Vui lòng chạy lại.');
       }
     }
   }
 
   function downloadFile() {
-    if (jobId) window.location = `/api/download/${jobId}`;
+    downloadResult('youtube');
+  }
+
+  function downloadResult(kind) {
+    const downloadUrl = completedResults?.[kind]?.download_url
+      || (completedJobId ? `/api/download/${completedJobId}/${kind}` : null);
+    if (downloadUrl) {
+      window.location = downloadUrl;
+    }
   }
 
   function setSection(name) {
@@ -500,12 +756,14 @@
     jobId = null;
     refreshJobsSummary();
     setSection('none');
+    resetResultsPanel();
     document.getElementById('scrapeBtn').disabled = false;
     document.getElementById('urlInput').value = '';
   }
 
   function showError(msg) {
     setSection('error');
+    setResultsVisible(false);
     document.getElementById('errorMsg').textContent = msg;
     document.getElementById('scrapeBtn').disabled = false;
   }

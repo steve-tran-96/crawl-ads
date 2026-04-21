@@ -26,7 +26,7 @@ OUTPUTS_DIR.mkdir(exist_ok=True)
 JOBS_FILE = OUTPUTS_DIR / "jobs.json"
 GIT_DIR = Path(__file__).parent / ".git"
 
-# job_id → { status, progress, total, message, file, error }
+# job_id → { status, progress, total, message, file, files, results, error }
 jobs: dict[str, dict] = {}
 
 # job_id → threading.Event (set = yêu cầu huỷ)
@@ -82,6 +82,24 @@ def _save_jobs():
         pass
 
 
+def _result_download_response(job: dict, kind: str):
+    files = job.get("files") or {}
+    file_path_raw = files.get(kind) or (job.get("file") if kind == "youtube" else None)
+    if job["status"] != "done" or not file_path_raw:
+        raise HTTPException(400, "File chưa sẵn sàng.")
+
+    file_path = Path(file_path_raw)
+    if not file_path.exists():
+        raise HTTPException(404, "File không tìm thấy trên server.")
+
+    download_name = "ads_youtube.xlsx" if kind == "youtube" else "ads_non_youtube.xlsx"
+    return FileResponse(
+        path=file_path,
+        filename=download_name,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
 _load_jobs()
 _save_jobs()
 
@@ -108,8 +126,12 @@ async def start_scrape(req: ScrapeRequest):
         "total": 0,
         "discovered": 0,
         "matched": 0,
+        "youtube_total": 0,
+        "non_youtube_total": 0,
         "message": "Đang khởi động...",
         "file": None,
+        "files": {},
+        "results": None,
         "error": None,
     }
     cancel_events[job_id] = threading.Event()
@@ -131,16 +153,17 @@ async def download_file(job_id: str):
     job = jobs.get(job_id)
     if not job:
         raise HTTPException(404, "Job không tồn tại.")
-    if job["status"] != "done" or not job["file"]:
-        raise HTTPException(400, "File chưa sẵn sàng.")
-    file_path = Path(job["file"])
-    if not file_path.exists():
-        raise HTTPException(404, "File không tìm thấy trên server.")
-    return FileResponse(
-        path=file_path,
-        filename="ads_export.xlsx",
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+    return _result_download_response(job, "youtube")
+
+
+@app.get("/api/download/{job_id}/{kind}")
+async def download_group_file(job_id: str, kind: str):
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job không tồn tại.")
+    if kind not in {"youtube", "non_youtube"}:
+        raise HTTPException(400, "Loại file không hợp lệ.")
+    return _result_download_response(job, kind)
 
 
 @app.get("/api/jobs")
@@ -238,11 +261,28 @@ async def _run_job(job_id: str, url: str):
         if job["status"] != "cancelled":
             job["status"] = "done"
             job["file"] = str(result.output_file)
+            job["files"] = {
+                "youtube": str(result.youtube_output_file),
+                "non_youtube": str(result.non_youtube_output_file),
+            }
+            job["results"] = {
+                "youtube": {
+                    "count": result.youtube_total,
+                    "download_url": f"/api/download/{job_id}/youtube",
+                },
+                "non_youtube": {
+                    "count": result.non_youtube_total,
+                    "download_url": f"/api/download/{job_id}/non_youtube",
+                },
+            }
             job["discovered"] = result.scanned_total
             job["total"] = result.scanned_total
             job["matched"] = result.exported_total
+            job["youtube_total"] = result.youtube_total
+            job["non_youtube_total"] = result.non_youtube_total
             job["message"] = (
-                f"Hoàn tất. Tìm thấy {result.exported_total} quảng cáo có YouTube ID "
+                f"Hoàn tất. Có {result.youtube_total} quảng cáo YouTube "
+                f"và {result.non_youtube_total} quảng cáo không phải YouTube "
                 f"trên {result.scanned_total} quảng cáo đã quét."
             )
     except Exception as e:

@@ -63,14 +63,25 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
-EXPORT_COLUMNS = ["creative_id", "product_name", "landing_page", "youtube_link"]
+EXPORT_COLUMNS = ["creative_id", "product_name", "landing_page", "youtube_link", "video_link"]
+EXPORT_COLUMN_LABELS = {
+    "creative_id": "Creative ID",
+    "product_name": "Tên sản phẩm",
+    "landing_page": "Landing Page",
+    "youtube_link": "Link YouTube",
+    "video_link": "Link Video",
+}
 
 
 @dataclass
 class ScrapeResult:
     output_file: Path
+    youtube_output_file: Path
+    non_youtube_output_file: Path
     scanned_total: int
     exported_total: int
+    youtube_total: int
+    non_youtube_total: int
 
 
 def yt_id_from_embed_url(url: str) -> str | None:
@@ -80,6 +91,56 @@ def yt_id_from_embed_url(url: str) -> str | None:
 
 def yt_link(video_id: str | None) -> str:
     return f"https://www.youtube.com/watch?v={video_id}" if video_id else ""
+
+
+def normalize_candidate_url(url: str | None) -> str:
+    if not url:
+        return ""
+    value = url.strip()
+    if not value or value == "about:blank":
+        return ""
+    return value
+
+
+def is_youtube_url(url: str) -> bool:
+    lower = url.lower()
+    return "youtube.com/" in lower or "youtu.be/" in lower
+
+
+def looks_like_video_url(url: str, resource_type: str = "") -> bool:
+    normalized = normalize_candidate_url(url)
+    if not normalized:
+        return False
+
+    lower = normalized.lower()
+    path = urlsplit(lower).path
+    video_extensions = (".mp4", ".m3u8", ".mpd", ".webm", ".mov", ".m4v")
+
+    return (
+        resource_type == "media"
+        or "youtube.com/embed/" in lower
+        or "googlevideo.com" in lower
+        or "videoplayback" in lower
+        or "manifest.googlevideo.com" in lower
+        or any(ext in path for ext in video_extensions)
+    )
+
+
+def pick_non_youtube_video_link(candidates: list[str]) -> str:
+    for candidate in candidates:
+        normalized = normalize_candidate_url(candidate)
+        if normalized and not is_youtube_url(normalized):
+            return normalized
+    return ""
+
+
+def collect_frame_video_candidates(page) -> list[str]:
+    candidates: list[str] = []
+    for frame in page.frames:
+        url = normalize_candidate_url(frame.url)
+        if url and looks_like_video_url(url):
+            candidates.append(url)
+    return candidates
 
 
 def creative_href_from_advertiser_url(
@@ -662,23 +723,88 @@ async def extract_creative_fields(first_dv_frame) -> tuple[str, str]:
     return product_name, landing_page
 
 
+async def extract_video_candidates_from_frame(frame) -> list[str]:
+    if frame is None:
+        return []
+
+    try:
+        candidates = await frame.evaluate(
+            """() => {
+                const urls = new Set();
+                const push = (value) => {
+                    if (typeof value === 'string' && value.trim()) {
+                        urls.add(value.trim());
+                    }
+                };
+
+                document.querySelectorAll('video').forEach((el) => {
+                    push(el.currentSrc);
+                    push(el.src);
+                    push(el.getAttribute('src'));
+                });
+                document.querySelectorAll('source[src]').forEach((el) => {
+                    push(el.src);
+                    push(el.getAttribute('src'));
+                });
+                document.querySelectorAll('iframe[src]').forEach((el) => {
+                    push(el.src);
+                    push(el.getAttribute('src'));
+                });
+                document.querySelectorAll('a[href]').forEach((el) => {
+                    push(el.href);
+                    push(el.getAttribute('href'));
+                });
+
+                return Array.from(urls);
+            }"""
+        )
+    except Exception:
+        return []
+
+    return [url for url in candidates if looks_like_video_url(url)]
+
+
 async def scrape_creative(page, relative_href: str) -> dict:
-    result = {"creative_id": "", "product_name": "", "landing_page": "", "youtube_link": ""}
+    result = {
+        "creative_id": "",
+        "product_name": "",
+        "landing_page": "",
+        "youtube_link": "",
+        "video_link": "",
+    }
     result["creative_id"] = creative_id_from_href(relative_href)
 
     detail_url = f"https://adstransparency.google.com{relative_href}"
+    request_video_candidates: list[str] = []
+
+    def capture_request(request) -> None:
+        candidate = normalize_candidate_url(request.url)
+        if candidate and looks_like_video_url(candidate, request.resource_type):
+            if candidate not in request_video_candidates:
+                request_video_candidates.append(candidate)
 
     try:
+        page.on("request", capture_request)
         await page.goto(detail_url, wait_until="domcontentloaded", timeout=DETAIL_NAV_TIMEOUT_MS)
         yt_ids, first_dv_frame = await wait_for_creative_signals(page)
         if yt_ids:
             result["youtube_link"] = yt_link(yt_ids[0])
+            result["video_link"] = result["youtube_link"]
 
         product_name, landing_page = await extract_creative_fields(first_dv_frame)
         result["product_name"] = product_name
         result["landing_page"] = landing_page
+
+        if not result["video_link"]:
+            dom_video_candidates = await extract_video_candidates_from_frame(first_dv_frame)
+            frame_video_candidates = collect_frame_video_candidates(page)
+            result["video_link"] = pick_non_youtube_video_link(
+                request_video_candidates + dom_video_candidates + frame_video_candidates
+            )
     except Exception as e:
         result["error"] = str(e)
+    finally:
+        page.remove_listener("request", capture_request)
 
     return result
 
@@ -748,8 +874,8 @@ async def scrape_creatives_parallel(
                 queue.task_done()
 
                 async with progress_lock:
+                    results[index] = data
                     if data.get("youtube_link"):
-                        results[index] = data
                         saved_count += 1
                         if on_saved:
                             await on_saved(saved_count)
@@ -778,7 +904,25 @@ async def scrape_creatives_parallel(
     workers = [asyncio.create_task(worker(worker_id)) for worker_id in range(1, worker_count + 1)]
     await asyncio.gather(*workers, return_exceptions=False)
 
-    return [row for row in results if row and row.get("youtube_link")]
+    return [row for row in results if row]
+
+
+def export_rows_to_excel(rows: list[dict], output_file: Path) -> None:
+    df = pd.DataFrame(rows, columns=EXPORT_COLUMNS)
+    df.index = df.index + 1
+    df.rename(columns=EXPORT_COLUMN_LABELS, inplace=True)
+
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="Ads", index=True, index_label="STT")
+        ws = writer.sheets["Ads"]
+        for col_letter, width in {"A": 6, "B": 22, "C": 55, "D": 55, "E": 45, "F": 45}.items():
+            ws.column_dimensions[col_letter].width = width
+        for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+            for cell in row:
+                if cell.value and str(cell.value).startswith("http"):
+                    cell.hyperlink = cell.value
+                    cell.style = "Hyperlink"
 
 
 async def run_scrape(
@@ -882,34 +1026,29 @@ async def run_scrape(
         )
 
         await browser.close()
-        await status(f"Đã lọc được {len(rows)} quảng cáo có YouTube ID.")
+        youtube_rows = [row for row in rows if row.get("youtube_link")]
+        non_youtube_rows = [row for row in rows if not row.get("youtube_link")]
+        await status(
+            f"Đã lọc được {len(youtube_rows)} quảng cáo có YouTube ID "
+            f"và {len(non_youtube_rows)} quảng cáo không phải YouTube."
+        )
 
     # Bước 3: Xuất Excel
-    df = pd.DataFrame(rows, columns=EXPORT_COLUMNS)
-    df.index = df.index + 1
-    df.rename(columns={
-        "creative_id": "Creative ID",
-        "product_name": "Tên sản phẩm",
-        "landing_page": "Landing Page",
-        "youtube_link": "Link YouTube",
-    }, inplace=True)
-
-    output_file.parent.mkdir(parents=True, exist_ok=True)
-    with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
-        df.to_excel(writer, sheet_name="Ads", index=True, index_label="STT")
-        ws = writer.sheets["Ads"]
-        for col_letter, width in {"A": 6, "B": 22, "C": 55, "D": 55, "E": 45}.items():
-            ws.column_dimensions[col_letter].width = width
-        for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
-            for cell in row:
-                if cell.value and str(cell.value).startswith("http"):
-                    cell.hyperlink = cell.value
-                    cell.style = "Hyperlink"
+    youtube_output_file = output_file
+    non_youtube_output_file = output_file.with_name(
+        f"{output_file.stem}.non-youtube{output_file.suffix}"
+    )
+    export_rows_to_excel(youtube_rows, youtube_output_file)
+    export_rows_to_excel(non_youtube_rows, non_youtube_output_file)
 
     return ScrapeResult(
-        output_file=output_file,
+        output_file=youtube_output_file,
+        youtube_output_file=youtube_output_file,
+        non_youtube_output_file=non_youtube_output_file,
         scanned_total=total,
-        exported_total=len(rows),
+        exported_total=len(youtube_rows),
+        youtube_total=len(youtube_rows),
+        non_youtube_total=len(non_youtube_rows),
     )
 
 
